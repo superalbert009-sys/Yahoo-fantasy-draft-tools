@@ -196,6 +196,9 @@ table.pl.rookiepool td.num, table.pl.rookiepool th { white-space: nowrap; }
 .verdict.cheap { background: var(--court-soft); color: var(--court); }
 .verdict.premium { background: var(--gold-soft); color: var(--gold); }
 .verdict.stop { background: var(--brick-soft); color: var(--brick); }
+.verdict.big { font: 700 30px/1.2 var(--font-num); text-align: center; letter-spacing: .06em; padding: 10px 12px; }
+.live-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 1040px) { .live-grid { grid-template-columns: minmax(0, 1fr); } }
 .optcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
 .opt { text-align: left; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
 .opt b { display: block; }
@@ -234,6 +237,8 @@ table.pl.rookiepool td.num, table.pl.rookiepool th { white-space: nowrap; }
         <button class="btn primary" data-act="open-setup">開始使用</button>
       </div>
     </section>
+
+    <section class="panel" id="live" hidden style="margin-bottom:16px"></section>
 
     <section class="panel" id="workspace" hidden>
       <div class="tabs" role="tablist">
@@ -417,15 +422,490 @@ window.ROOKIE_POOL = [
     "blurb": "選秀順位偏後段,但夏季聯盟其中一戰打出 17 分、6 籃板、4 助攻,帶隊逆轉 16 分落後獲勝,展現一定的持球策應能力。身材條件不錯,鳳凰城的鋒線輪替深,能不能拿到穩定上場時間仍是最大變數。" }
 ];
 </script>
-<script>
-/* 選秀計算引擎:估值 / 選秀狀態 / 推薦 / 策略 / CSV 匯入。
- * 與 bridge/ 內的 Python 版演算法一致 (tests/engine.test.js 會逐數字比對)。
- * 純函式庫,不碰 DOM;瀏覽器與 Node 都能載入。 */
+<script id="src-hm">
+/* Historical-Only 球員估值模型 —— 規格補完模組 (新增檔案,尚未接入既有引擎)。
+ *
+ * 範圍聲明:這個檔案只實作 fantasy_auction_player_model_spec_historical_only.md
+ * 中「目前缺少」的純函式 (審查報告第 2 節)。刻意不去動 engine.js 既有的
+ * buildModel / buildContext / evaluate / recommend,也不重新命名任何既有欄位
+ * (market / fair / worth / target / ceiling / dollars) —— 那些屬於報告第 3 節
+ * 的「衝突」,尚待另外決定,不在這次範圍內。
+ *
+ * 這裡的函式目前是「服務層可用、但尚未被 UI 或既有引擎呼叫」的獨立模組,
+ * 可以直接單元測試,之後若要接上既有流程,再另外討論怎麼接。
+ *
+ * 涵蓋 (對照規格章節):
+ *   computeHistoricalForm          §5   三季歷史加權 (recency × sample reliability)
+ *   computeHistoricalAvailability  §7   歷史出勤 / availability multiplier (獨立權重軌道,不含 sample reliability)
+ *   computeAssignmentLoss          §8   joint position assignment 的邊際損失 (bipartite 最大權重比對)
+ *   validatePlayerSeasonData       §22.1 資料合法性檢查
+ *   filterNonPlayerRows            §4.3 非球員列 (League Average 等)
+ *   summarizeHistoricalCompleteness §22.3 / §21.1 History Seasons Available 分佈
+ *   computePersonalMax             §18  純函式版本 (floor + legal max),尚未接入即時計算流程
+ */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
-  else root.Engine = factory();
+  else root.HistoricalModel = factory();
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
+
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  const clip = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+  const sum = (a) => a.reduce((s, x) => s + x, 0);
+
+  const DEFAULT_RECENCY = { '2025-26': 0.50, '2024-25': 0.30, '2023-24': 0.20 };
+  // 規格 §5.4:只加權這些逐場數據;百分比一律由加權後的 makes/attempts 導出,不直接加權百分比本身。
+  const COUNT_KEYS = ['min', 'fgm', 'fga', 'ftm', 'fta', 'tpm', 'tpa', 'pts', 'oreb', 'reb', 'ast', 'stl', 'blk', 'tov'];
+
+  // ================================================================ §5 三季歷史加權 (Historical Form)
+  /**
+   * seasons: { seasonLabel: { gp, min, fgm, fga, ftm, fta, tpm, tpa, pts, oreb, reb, ast, stl, blk, tov } }
+   *          缺席的球季直接不要放進物件裡 (不要放 null/0 佔位)。
+   * opts.recencyWeights: { seasonLabel: weight } (預設規格的 2025-26/2024-25/2023-24 = 0.50/0.30/0.20)
+   * opts.gamesPossible:  { seasonLabel: number }  (預設每季 82)
+   *
+   * 回傳 { historySeasonsAvailable, weightedPerGame, seasonWeights }
+   *   - 0 季時 weightedPerGame = null (規格 §5.3:0 季 = NO NBA HISTORY,不得自動生成歷史 Fair Value)
+   *   - weightedPerGame 的每個欄位,只用「該欄位有值的球季」做加權平均並重新 normalize,
+   *     避免單一球季缺個欄位就讓整個歷史紀錄作廢。
+   */
+  function computeHistoricalForm(seasons, opts) {
+    opts = opts || {};
+    const recency = opts.recencyWeights || DEFAULT_RECENCY;
+    const gamesPossible = opts.gamesPossible || {};
+    const labels = Object.keys(seasons || {}).filter((k) => seasons[k] && isNum(seasons[k].gp) && seasons[k].gp > 0);
+    if (!labels.length) return { historySeasonsAvailable: 0, weightedPerGame: null, seasonWeights: {} };
+
+    const effective = {};
+    labels.forEach((lb) => {
+      const base = recency[lb];
+      if (!isNum(base)) throw new Error(`computeHistoricalForm: 未知的球季標籤「${lb}」,請在 opts.recencyWeights 提供對應的 recency 權重。`);
+      const gpPossible = gamesPossible[lb] || 82;
+      const reliability = Math.sqrt(clip(seasons[lb].gp / gpPossible, 0, 1)); // §5.2 sample reliability,只用在能力估計
+      effective[lb] = base * reliability;
+    });
+    const effSum = sum(Object.values(effective));
+    const seasonWeights = {};
+    labels.forEach((lb) => { seasonWeights[lb] = effSum > 0 ? effective[lb] / effSum : 1 / labels.length; });
+
+    const weightedPerGame = {};
+    COUNT_KEYS.forEach((k) => {
+      let wsum = 0, wtot = 0;
+      labels.forEach((lb) => {
+        const v = seasons[lb][k];
+        if (isNum(v)) { wsum += v * seasonWeights[lb]; wtot += seasonWeights[lb]; }
+      });
+      weightedPerGame[k] = wtot > 0 ? wsum / wtot : null;
+    });
+
+    return { historySeasonsAvailable: labels.length, weightedPerGame, seasonWeights };
+  }
+
+  // ================================================================ §7 歷史出勤 (Historical Availability)
+  // 重要:這條權重軌道跟 §5 的 sample-reliability 軌道是分開的兩件事 (規格 §7.1 明講「這裡不使用 sample reliability 權重」)。
+  const AVAIL_DEFAULTS = { exponent: 0.55, multMin: 0.78, multMax: 1.06, gpMin: 40, gpMax: 79, gpRefDay: 70, seasonLength: 82 };
+
+  /**
+   * seasons: { seasonLabel: { gp } } —— 這裡只需要 GP。
+   * manualGpAdjustment: 可正可負的手動調整值 (規格 §3.3 / §7.2),預設 0。
+   * 回傳 { historySeasonsAvailable, historicalExpectedGp, finalExpectedGp, availabilityMultiplier, seasonWeights }
+   *   0 季時全部欄位為 null (沒有歷史出勤可以估)。
+   */
+  function computeHistoricalAvailability(seasons, manualGpAdjustment, opts) {
+    opts = Object.assign({}, AVAIL_DEFAULTS, opts || {});
+    const recency = opts.recencyWeights || DEFAULT_RECENCY;
+    const gamesPossible = opts.gamesPossible || {};
+    manualGpAdjustment = isNum(manualGpAdjustment) ? manualGpAdjustment : 0;
+    const labels = Object.keys(seasons || {}).filter((k) => seasons[k] && isNum(seasons[k].gp));
+    if (!labels.length) {
+      return { historySeasonsAvailable: 0, historicalExpectedGp: null, finalExpectedGp: null, availabilityMultiplier: null, seasonWeights: {} };
+    }
+    const base = {};
+    labels.forEach((lb) => {
+      if (!isNum(recency[lb])) throw new Error(`computeHistoricalAvailability: 未知的球季標籤「${lb}」,請在 opts.recencyWeights 提供對應的 recency 權重。`);
+      base[lb] = recency[lb];
+    });
+    const baseSum = sum(Object.values(base));
+    const seasonWeights = {};
+    labels.forEach((lb) => { seasonWeights[lb] = baseSum > 0 ? base[lb] / baseSum : 1 / labels.length; });
+
+    let weightedRate = 0;
+    labels.forEach((lb) => {
+      const gpPossible = gamesPossible[lb] || opts.seasonLength;
+      weightedRate += clip(seasons[lb].gp / gpPossible, 0, 1) * seasonWeights[lb];
+    });
+    const historicalExpectedGp = weightedRate * opts.seasonLength;
+    const finalExpectedGp = clip(historicalExpectedGp + manualGpAdjustment, opts.gpMin, opts.gpMax);
+    const availabilityMultiplier = clip(Math.pow(finalExpectedGp / opts.gpRefDay, opts.exponent), opts.multMin, opts.multMax);
+    return { historySeasonsAvailable: labels.length, historicalExpectedGp, finalExpectedGp, availabilityMultiplier, seasonWeights };
+  }
+
+  // ================================================================ §8 Position Assignment Loss
+  // 最小費用最大流 (Successive Shortest Path / Bellman-Ford),求「最大權重二分匹配,允許部分空缺」。
+  // 這是規格裡完全沒有對應現有程式碼的新演算法:現有 engine.js 的 maxMatch() 只算「配對得上幾個」,
+  // 不是這裡需要的「總分數最大化」的加權匹配。
+  class MinCostFlow {
+    constructor(n) { this.n = n; this.graph = Array.from({ length: n }, () => []); }
+    addEdge(u, v, cap, cost) {
+      this.graph[u].push({ to: v, cap, cost, flow: 0, rev: this.graph[v].length });
+      this.graph[v].push({ to: u, cap: 0, cost: -cost, flow: 0, rev: this.graph[u].length - 1 });
+    }
+    // 反覆找「總花費會再變小 (=總分數會再變大)」的最短擴增路徑,找不到就停止 (不強制填滿所有容量)。
+    solve(s, t) {
+      let totalCost = 0;
+      for (;;) {
+        const dist = new Array(this.n).fill(Infinity);
+        const inQueue = new Array(this.n).fill(false);
+        const prevEdge = new Array(this.n).fill(null);
+        dist[s] = 0;
+        const queue = [s]; inQueue[s] = true;
+        while (queue.length) {
+          const u = queue.shift(); inQueue[u] = false;
+          for (const e of this.graph[u]) {
+            if (e.cap - e.flow > 0 && dist[u] + e.cost < dist[e.to] - 1e-9) {
+              dist[e.to] = dist[u] + e.cost;
+              prevEdge[e.to] = { u, e };
+              if (!inQueue[e.to]) { queue.push(e.to); inQueue[e.to] = true; }
+            }
+          }
+        }
+        if (dist[t] === Infinity || dist[t] >= -1e-9) break;
+        let aug = Infinity, v = t;
+        while (v !== s) { const { u, e } = prevEdge[v]; aug = Math.min(aug, e.cap - e.flow); v = u; }
+        v = t;
+        while (v !== s) { const { u, e } = prevEdge[v]; e.flow += aug; this.graph[e.to][e.rev].flow -= aug; v = u; }
+        totalCost += aug * dist[t];
+      }
+      return { totalCost };
+    }
+  }
+
+  /** players: [{ id, eligible: Set|Array(positionLabel), score }]  slotCaps: { positionLabel: capacity } */
+  function solveAssignment(players, slotCaps) {
+    const types = Object.keys(slotCaps).filter((t) => slotCaps[t] > 0);
+    const SRC = 0, TYPE0 = 1, PLAYER0 = TYPE0 + types.length, SNK = PLAYER0 + players.length;
+    const mcmf = new MinCostFlow(SNK + 1);
+    types.forEach((t, ti) => mcmf.addEdge(SRC, TYPE0 + ti, slotCaps[t], 0));
+    players.forEach((_p, pi) => mcmf.addEdge(PLAYER0 + pi, SNK, 1, 0));
+    types.forEach((t, ti) => {
+      players.forEach((p, pi) => { if (p.eligible.has(t)) mcmf.addEdge(TYPE0 + ti, PLAYER0 + pi, 1, -p.score); });
+    });
+    const { totalCost } = mcmf.solve(SRC, SNK);
+    const assignment = new Map(players.map((p) => [p.id, null]));
+    types.forEach((t, ti) => {
+      mcmf.graph[TYPE0 + ti].forEach((e) => {
+        if (e.to >= PLAYER0 && e.to < SNK && e.flow > 0) assignment.set(players[e.to - PLAYER0].id, t);
+      });
+    });
+    return { totalScore: -totalCost, assignment };
+  }
+
+  /**
+   * players: [{ id, eligible: Set|Array(positionLabel), score }]
+   * slotCaps: { positionLabel: capacity } —— 例如規格的 dedicated slots
+   *   { PG:14, SG:14, G:14, SF:14, PF:14, F:14, C:28 }
+   * 回傳 { totalScore, assignment: Map(id -> 分配到的 slot type 或 null), losses: Map(id -> assignment_loss) }
+   *
+   * 效能備註 (先求正確,效能留待接入既有引擎時再優化):
+   * 只對「有進入最佳分配」的球員重新求解一次 (移除該球員後的最佳總分);
+   * 沒被分配到任何 slot 的球員,移除他們必然不影響最佳解,loss 直接為 0,不必重算。
+   * 這對目前測試用的小規模資料沒有問題;若之後要對整個 ~260 人估值母體即時計算,
+   * 建議另外評估效能 (例如用增量式重新求解,而不是每人重新跑一次完整的 min-cost flow)。
+   */
+  function computeAssignmentLoss(players, slotCaps) {
+    const norm = players.map((p) => ({ id: p.id, score: p.score, eligible: p.eligible instanceof Set ? p.eligible : new Set(p.eligible || []) }));
+    const full = solveAssignment(norm, slotCaps);
+    const losses = new Map();
+    norm.forEach((p) => {
+      if (full.assignment.get(p.id) == null) { losses.set(p.id, 0); return; }
+      const without = norm.filter((x) => x.id !== p.id);
+      const alt = solveAssignment(without, slotCaps);
+      losses.set(p.id, Math.max(0, full.totalScore - alt.totalScore));
+    });
+    return { totalScore: full.totalScore, assignment: full.assignment, losses };
+  }
+
+  // ================================================================ Phase 1:估值管線用的純函式
+  /**
+   * §7.3 + §7.4 sign-safe 出勤調整,加上使用者的「出勤調整強度」(C2 決策)。
+   *   有效係數 = 1 + strength × (availabilityMultiplier − 1)
+   *   strength = 1 → 完全照規格;strength = 0 → 不做任何出勤調整。
+   *   sign-safe:只作用在正分,負分原樣保留 → 低出勤不會變成負價值球員的加分。
+   *   multiplier 缺值 (沒有任何 GP 歷史) → 視為 1,不調整。
+   */
+  function effectiveAvailability(availabilityMultiplier, strength) {
+    const m = isNum(availabilityMultiplier) ? availabilityMultiplier : 1;
+    const k = isNum(strength) ? clip(strength, 0, 1) : 1;
+    return 1 + k * (m - 1);
+  }
+  function applyAvailability(score, effectiveMultiplier) {
+    if (!isNum(score)) return score;
+    const m = isNum(effectiveMultiplier) ? effectiveMultiplier : 1;
+    return score > 0 ? score * m : score;
+  }
+
+  /**
+   * §8 聯盟層級位置稀缺 (C3:與使用者陣容的邊際價值分開)。
+   * players:  [{ id, eligible: Set|Array, score }]   score = 出勤調整後的全域分數 (risk score)
+   * slotCaps: 只含「專屬位置」的名額 (例如 {PG: 隊數×1, ..., C: 隊數×2}),呼叫端負責排除 UTIL/BN/IL (C4)。
+   *
+   * 與 computeAssignmentLoss 的差別:這裡用「最大基數」指派 —— 只要有合格球員,名額一定會被填滿。
+   * 作法是每位球員分數加上同一個常數 BIG (> −最低分);因為分數只跟球員有關、與被分到哪個名額無關,
+   * 在指派人數相同時 BIG 會完全抵銷,所以 loss 仍然等於「此球員分數 − 遞補者分數」,與 z-score 的零點無關。
+   * 若移除某球員後名額填不滿 (該位置沒有深度),記為 infeasible,loss 以 max(score, 0) 計,並回報。
+   *
+   * 效能:只取分數前 candidateLimit 名 (預設 2 × 總名額) 當候選。遞補者一定來自名額附近的球員,
+   *       這是實務上的截斷,不是數學上的嚴格保證 (已在回報中註明)。
+   */
+  function computeLeagueScarcity(players, slotCaps, opts) {
+    opts = opts || {};
+    const totalSlots = sum(Object.values(slotCaps || {}).map((v) => Math.max(v || 0, 0)));
+    const losses = new Map();
+    (players || []).forEach((p) => losses.set(p.id, 0));
+    if (!totalSlots) return { losses, assignment: new Map(), filled: 0, totalSlots: 0, feasible: true, infeasibleIds: [] };
+    const limit = opts.candidateLimit || totalSlots * 2;
+    const cands = (players || [])
+      .map((p) => ({ id: p.id, score: p.score, eligible: p.eligible instanceof Set ? p.eligible : new Set(p.eligible || []) }))
+      .filter((p) => isNum(p.score) && [...p.eligible].some((t) => (slotCaps[t] || 0) > 0))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+    if (!cands.length) return { losses, assignment: new Map(), filled: 0, totalSlots, feasible: false, infeasibleIds: [] };
+    const minScore = Math.min(...cands.map((p) => p.score));
+    const BIG = Math.max(0, -minScore) + 1;
+    const shifted = cands.map((p) => ({ id: p.id, eligible: p.eligible, score: p.score + BIG }));
+    const full = solveAssignment(shifted, slotCaps);
+    const filled = [...full.assignment.values()].filter((v) => v != null).length;
+    const infeasibleIds = [];
+    shifted.forEach((p, idx) => {
+      if (full.assignment.get(p.id) == null) return;           // 沒被用到的球員,移除不影響結果
+      const alt = solveAssignment(shifted.filter((x) => x.id !== p.id), slotCaps);
+      const altFilled = [...alt.assignment.values()].filter((v) => v != null).length;
+      if (altFilled < filled) { infeasibleIds.push(p.id); losses.set(p.id, Math.max(cands[idx].score, 0)); return; }
+      losses.set(p.id, Math.max(0, full.totalScore - alt.totalScore));
+    });
+    return { losses, assignment: full.assignment, filled, totalSlots, feasible: filled >= totalSlots, infeasibleIds };
+  }
+
+  /**
+   * C5 陣容價值:把陣容以「相對替補的分數」做最大權重指派到先發名額 (含 UTIL/G/F 等彈性位置)。
+   * roster:   [{ id, eligible: Set|Array, rel }]   rel = 個人化分數 − 個人化替補線;UTIL 資格由呼叫端加入 eligible。
+   * slotCaps: 先發名額 (含 UTIL,不含 BN/IL)
+   * 回傳 active (先發指派總和) + benchWeight × (未排進先發、依序最好的 benchSlots 名的正值 rel 總和)。
+   * 允許部分空缺:空著的先發名額視為之後能用替補級球員補上 (rel = 0),所以負值球員不會被硬排進先發。
+   */
+  function rosterAssignmentValue(roster, slotCaps, benchWeight, benchSlots) {
+    const norm = (roster || []).map((p) => ({ id: p.id, score: isNum(p.rel) ? p.rel : 0, eligible: p.eligible instanceof Set ? p.eligible : new Set(p.eligible || []) }));
+    const res = solveAssignment(norm, slotCaps || {});
+    let bench = 0;
+    const bw = isNum(benchWeight) ? Math.max(benchWeight, 0) : 0;
+    if (bw > 0) {
+      const rest = norm.filter((p) => res.assignment.get(p.id) == null).map((p) => Math.max(p.score, 0)).sort((a, b) => b - a);
+      bench = bw * sum(rest.slice(0, Math.max(benchSlots || 0, 0)));
+    }
+    return { total: res.totalScore + bench, active: res.totalScore, bench, assignment: res.assignment };
+  }
+
+  // ================================================================ §22.1 資料合法性
+  /**
+   * rows: 每季每位球員一筆的原始紀錄陣列,欄位對照規格 §3.1 映射後的名稱
+   *       (fgm/fga/ftm/fta/tpm/tpa/oreb/reb/gp/min ...)。
+   * 回傳違規清單 (不會丟例外,由呼叫端決定要怎麼處理,例如擋下匯入或只顯示警告)。
+   */
+  function validatePlayerSeasonData(rows, keyFn) {
+    keyFn = keyFn || ((r) => `${r.playerId || r.name}__${r.season || ''}`);
+    const issues = [];
+    const seen = new Map();
+    (rows || []).forEach((r, idx) => {
+      const label = r.name ? `${r.name}${r.season ? '(' + r.season + ')' : ''}` : `第 ${idx + 1} 列`;
+      const push = (message) => issues.push({ index: idx, name: r.name || null, season: r.season || null, message });
+      if (isNum(r.fgm) && isNum(r.fga) && r.fgm > r.fga) push(`${label}: FGM (${r.fgm}) 大於 FGA (${r.fga})`);
+      if (isNum(r.ftm) && isNum(r.fta) && r.ftm > r.fta) push(`${label}: FTM (${r.ftm}) 大於 FTA (${r.fta})`);
+      if (isNum(r.tpm) && isNum(r.tpa) && r.tpm > r.tpa) push(`${label}: 3PM (${r.tpm}) 大於 3PA (${r.tpa})`);
+      if (isNum(r.tpm) && isNum(r.fgm) && r.tpm > r.fgm) push(`${label}: 3PM (${r.tpm}) 大於 FGM (${r.fgm})`);
+      if (isNum(r.tpa) && isNum(r.fga) && r.tpa > r.fga) push(`${label}: 3PA (${r.tpa}) 大於 FGA (${r.fga})`);
+      if (isNum(r.oreb) && isNum(r.reb) && r.oreb > r.reb) push(`${label}: OREB (${r.oreb}) 大於 REB (${r.reb})`);
+      if (isNum(r.gp) && (r.gp < 0 || r.gp > 85)) push(`${label}: GP (${r.gp}) 超出合理範圍 (0-85)`);
+      if (isNum(r.min) && (r.min < 0 || r.min > 48)) push(`${label}: MP (${r.min}) 超出合理範圍 (0-48)`);
+      const key = keyFn(r);
+      if (seen.has(key)) push(`${label}: 與第 ${seen.get(key) + 1} 列重複 (同一位球員同一季出現兩筆紀錄)`);
+      else seen.set(key, idx);
+    });
+    return issues;
+  }
+
+  // ================================================================ §4.3 非球員列
+  const NON_PLAYER_NAME_RE = /^(league average|team totals?|western conference|eastern conference|total|totals)$/i;
+  function isNonPlayerRow(name) { return NON_PLAYER_NAME_RE.test(String(name || '').trim()); }
+  function filterNonPlayerRows(rows, nameKey) {
+    nameKey = nameKey || 'name';
+    const kept = [], removed = [];
+    (rows || []).forEach((r) => { (isNonPlayerRow(r[nameKey]) ? removed : kept).push(r); });
+    return { kept, removed };
+  }
+
+  // ================================================================ §22.3 / §21.1 History Seasons Available 分佈
+  function summarizeHistoricalCompleteness(players, seasonsField) {
+    seasonsField = seasonsField || 'historySeasonsAvailable';
+    const buckets = { 3: [], 2: [], 1: [], 0: [] };
+    (players || []).forEach((p) => {
+      const n = clip(Math.round(p[seasonsField] || 0), 0, 3);
+      buckets[n].push(p);
+    });
+    return {
+      threeSeasonPlayers: buckets[3], twoSeasonPlayers: buckets[2], oneSeasonPlayers: buckets[1], zeroSeasonPlayers: buckets[0],
+      counts: { 3: buckets[3].length, 2: buckets[2].length, 1: buckets[1].length, 0: buckets[0].length },
+    };
+  }
+
+  // ================================================================ 與既有引擎串接的整合小工具 (仍是純函式)
+  // 這裡不 import engine.js,姓名正規化一律由呼叫端注入 (normalizeName),
+  // 讓這個檔案繼續保持獨立、可單獨測試,也不假設任何特定聯盟的隊數/預算/位置/類別設定 ——
+  // 這兩個函式只處理「球員逐場數據」這個維度,recency 權重依「上傳順序」(新到舊) 決定,
+  // 不綁定任何特定年份標籤或特定聯盟假設。
+
+  const DEFAULT_RECENCY_BY_ORDER = [0.50, 0.30, 0.20];
+
+  function _recencyWeightsByOrder(seasonsArray, recencyByOrder) {
+    recencyByOrder = recencyByOrder || DEFAULT_RECENCY_BY_ORDER;
+    const weights = {};
+    (seasonsArray || []).forEach((s, i) => { weights[s.label] = recencyByOrder[i] != null ? recencyByOrder[i] : 0; });
+    return weights;
+  }
+
+  /**
+   * seasonsArray: [{ label, players }, ...],由「最新」排到「最舊」(索引 0 = 最新一季)。
+   * normalizeName: (string) => string —— 通常直接傳入既有引擎的 normName,用來跨季比對同一位球員。
+   * recencyByOrder: 依「新到舊」給的權重陣列,預設 [0.50, 0.30, 0.20] (規格 §5.1 的比例,但依上傳順序決定,
+   *                 不綁定任何特定年份字串,才不會被限定在特定聯盟/特定球季假設上)。
+   *
+   * 回傳一份新的球員陣列,可以直接餵給既有、完全不修改的 buildModel():
+   *   身分/位置/球隊/傷病/ADP 一律取「該球員最新一次出現」的那一筆 (因為 seasonsArray 由新到舊,
+   *   同一位球員第一次出現時的資料就是最新一季的資料);逐場數值統計欄位換成三季加權後的結果,
+   *   並附上 historySeasonsAvailable。
+   */
+  function blendSeasonsForModel(seasonsArray, normalizeName, recencyByOrder) {
+    const recencyWeights = _recencyWeightsByOrder(seasonsArray, recencyByOrder);
+    const byName = new Map(); // nkey -> { latest, seasons: { label: row } }
+    (seasonsArray || []).forEach((s) => {
+      (s.players || []).forEach((p) => {
+        const nk = normalizeName(p.name);
+        if (!byName.has(nk)) byName.set(nk, { latest: p, seasons: {} });
+        byName.get(nk).seasons[s.label] = p;
+      });
+    });
+    const out = [];
+    byName.forEach((entry) => {
+      const form = computeHistoricalForm(entry.seasons, { recencyWeights });
+      const row = Object.assign({}, entry.latest, form.weightedPerGame || {});
+      row.historySeasonsAvailable = form.historySeasonsAvailable;
+      out.push(row);
+    });
+    return out;
+  }
+
+  /**
+   * 幫「已經跑完 buildModel() 的球員陣列」附加歷史出勤資訊 (§7)。純資訊用途,
+   * 不會改動任何一個球員的 value / dollars —— 那屬於既有估值公式,這次不動它。
+   * manualGpAdjustmentByName: 選填的 { normalizedName: adjustment }。
+   */
+  function attachHistoricalAvailability(players, seasonsArray, normalizeName, manualGpAdjustmentByName, opts) {
+    manualGpAdjustmentByName = manualGpAdjustmentByName || {};
+    opts = opts || {};
+    const recencyWeights = _recencyWeightsByOrder(seasonsArray, opts.recencyByOrder);
+    const byName = new Map();
+    (seasonsArray || []).forEach((s) => {
+      (s.players || []).forEach((p) => {
+        if (!isNum(p.gp)) return;
+        const nk = normalizeName(p.name);
+        if (!byName.has(nk)) byName.set(nk, {});
+        byName.get(nk)[s.label] = { gp: p.gp };
+      });
+    });
+    (players || []).forEach((p) => {
+      const nk = normalizeName(p.name);
+      const seasons = byName.get(nk) || {};
+      const adj = isNum(manualGpAdjustmentByName[nk]) ? manualGpAdjustmentByName[nk] : 0;
+      const o = Object.assign({}, opts, { recencyWeights });
+      const r = computeHistoricalAvailability(seasons, adj, o);
+      const r0 = adj ? computeHistoricalAvailability(seasons, 0, o) : r;
+      p.historySeasonsAvailable = r.historySeasonsAvailable;
+      p.historicalExpectedGp = r.historicalExpectedGp;
+      p.finalExpectedGp = r.finalExpectedGp;
+      p.availabilityMultiplier = r.availabilityMultiplier;                // 含手動 GP 調整 → Risk-adjusted 層 (實際定價用)
+      p.historicalAvailabilityMultiplier = r0.availabilityMultiplier;     // 只看歷史出勤 → Availability-adjusted 層
+      p.manualGpAdjustment = adj;
+    });
+  }
+
+  // ================================================================ §18 Personal Max (純函式;尚未接入 evaluate())
+  /** floor(min(personalValue, strategyCeiling, legalMaxBid));缺值會被忽略,全部缺值回傳 null。 */
+  function computePersonalMax(personalValue, strategyCeiling, legalMaxBid) {
+    const candidates = [personalValue, strategyCeiling, legalMaxBid].filter(isNum);
+    if (!candidates.length) return null;
+    return Math.floor(Math.min(...candidates));
+  }
+
+  return {
+    DEFAULT_RECENCY, DEFAULT_RECENCY_BY_ORDER, COUNT_KEYS,
+    computeHistoricalForm, computeHistoricalAvailability,
+    computeAssignmentLoss, solveAssignment, MinCostFlow,
+    validatePlayerSeasonData, isNonPlayerRow, filterNonPlayerRows,
+    summarizeHistoricalCompleteness, computePersonalMax,
+    blendSeasonsForModel, attachHistoricalAvailability,
+    effectiveAvailability, applyAvailability, computeLeagueScarcity, rosterAssignmentValue,
+  };
+});
+
+</script>
+<script id="src-engine">
+/* 選秀計算引擎:估值 / 選秀狀態 / 推薦 / 策略 / CSV 匯入。
+ * 唯一的估值管線:所有價值計算都在這裡 (規格的純函式由 historical-model.js 提供)。
+ * z-score / baseline 的計算與 bridge/ 的 Python 版一致 (tests/engine.test.js 逐數字比對);
+ * Phase 1 起的出勤、位置稀缺、替補線、陣容邊際價值只在 JS 版實作 (Python CLI 估值層未同步)。
+ * 純函式庫,不碰 DOM;瀏覽器與 Node 都能載入。 */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./historical-model.js'));
+  else root.Engine = factory(root.HistoricalModel);
+})(typeof self !== 'undefined' ? self : this, function (HM) {
+  'use strict';
+  if (!HM) throw new Error('engine.js 需要先載入 historical-model.js');
+
+  /* ------------------------------------------------------------------ 欄位語意映射 (C1:舊欄位不改名)
+   * 本專案既有欄位名稱與規格文件 / 第二階段需求用語的對照。規格的 Fair $ / Market $ 命名方向與本專案相反,
+   * 所以新程式碼一律以這張表為準,不要憑字面猜。 */
+  /* ------------------------------------------------------------------ 模型版本 (semver)
+   * MAJOR:同樣的輸入會得到不同的數字 (公式改變)。
+   * MINOR:只新增輸出欄位,既有數字完全不變。
+   * PATCH:修正或重構,輸出完全相同。
+   * tests/engine.test.js 以「黃金值」強制這條規則:輸出數字一改變,沒有升版就會測試失敗。
+   * 估值模型 1.x = 舊版 (Python CLI,已凍結);2.0.0 = 第二階段 Phase 1–4 (出勤、聯盟位置稀缺、完整名額池替補線、
+   *   陣容邊際價值、手動調整)。涵蓋所有會寫進成交快照的數字 (全域價值、美元、預期成交價、對我的價值、出價)。
+   * 決策模型 1.0.0 = 威脅、提名、四軌推薦、Snake 生存估計、run 偵測、現場決策 (heuristic)。
+   * 2.1.0 / 1.1.0 (Phase 5):新增 evaluate 的 lite 模式、Snake 最佳人選、選秀模擬;既有數字完全不變 (MINOR,黃金值相同)。
+   * 同一主版本內的數字保證相同,所以市場校準依「主版本」比對。 */
+  const VALUATION_MODEL_VERSION = '2.1.0';
+  const DECISION_MODEL_VERSION = '1.1.0';
+  const majorOf = (v) => (v ? String(v).split('.')[0] : null);
+  const sameMajor = (a, b) => !!a && !!b && majorOf(a) === majorOf(b);
+
+  const FIELD_SEMANTICS = {
+    'player.value':     { meaning: '全域價值分數 = 出勤調整後分數 + 聯盟位置稀缺加成 (排名依據)', spec: 'scarcity_adjusted_score (§8.3)' },
+    'player.dollars':   { meaning: '全域基礎價,未含即時通膨', spec: 'Fair $ (§9.3)', request: 'Base / Global Value' },
+    'rec.market':       { meaning: '與 player.dollars 相同 (evaluate 回傳的別名)', spec: 'Fair $ (§9.3)' },
+    'rec.fair':         { meaning: '含即時通膨的預期成交價', spec: 'Market $ (§11.4)', request: 'Expected Market Price' },
+    'rec.worth':        { meaning: '對我的價值 (個人化,已反映當下剩餘資金)', spec: '(本專案自有算法,非 §17 公式)', request: 'Personal Value' },
+    'rec.target':       { meaning: '建議出價', spec: 'Target $ (策略層)' },
+    'rec.ceiling':      { meaning: '放棄上限,不超過 maxBid', spec: '接近 Personal Max (§18)', request: 'Maximum Bid (個人)' },
+    'rec.mrv':          { meaning: '陣容邊際價值 (分數單位,高於個人化替補線)', request: 'Marginal Roster Value' },
+    'state.maxBid()':   { meaning: '合法最高出價', spec: 'legal_max_bid (§18)' },
+    // 成交快照 (pick.snap):命名依規格語意,避免與本專案 rec.fair (= 規格 Market $) 混淆
+    'snap.playerValue':   { meaning: '成交當下的全域價值分數 (= player.value)' },
+    'snap.fairValue':     { meaning: '成交當下的全域基礎價 (= player.dollars,未含通膨)', spec: 'Fair $' },
+    'snap.marketValue':   { meaning: '成交當下的預期成交價 (= rec.fair,含通膨)', spec: 'Market $' },
+    'snap.personalValue': { meaning: '成交當下「我」對這名球員的決策值 (= rec.decisionWorth);我的陣容已滿或放不下時為 null' },
+    'snap.maxBid':        { meaning: '成交當下「我」的放棄上限 (= rec.ceiling);Snake 為 null' },
+    'snap.buyerLegalMax': { meaning: '得標隊伍在這一手之前的合法最高出價' },
+  };
 
   // ------------------------------------------------------------------ 常數
   const RATIO_SPECS = { fg_pct: ['fgm', 'fga'], ft_pct: ['ftm', 'fta'], tp_pct: ['tpm', 'tpa'], a_t: ['ast', 'tov'] };
@@ -508,13 +988,92 @@ window.ROOKIE_POOL = [
   const maxMatch = (slots, playersPos) => matchDetail(slots, playersPos).count;
 
   // ------------------------------------------------------------------ 估值
-  function gpAdjust(z, f, gpWeight) { return z - gpWeight * Math.max(z, 0) * (1 - f); }
+  // ------------------------------------------------------------------ 設定指紋 (稽核用,不是加密)
+  function fnv1a(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, '0');
+  }
+  function stableStringify(v) {
+    if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+    if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+    return JSON.stringify(v === undefined ? null : v);
+  }
+  const FINGERPRINT_FIELDS = ['name', 'pos', 'gp', 'min', 'fgm', 'fga', 'ftm', 'fta', 'tpm', 'tpa', 'pts', 'oreb', 'dreb', 'reb', 'ast', 'stl', 'blk', 'tov', 'pf', 'dd', 'td', 'fg_pct', 'ft_pct'];
+  /** 全域指紋:只包含會影響全域價值 (value / dollars) 的聯盟設定、估值設定、資料、以及手動出賽數調整。 */
+  function globalFingerprint(settings, cfg, seasons, primaryIdx, overrides) {
+    const gpOv = {};
+    Object.keys(overrides || {}).sort().forEach((k) => { const g = overrides[k] && overrides[k].gpAdjustment; if (isNum(g) && g !== 0) gpOv[k] = g; });
+    return fnv1a(stableStringify({
+      settings: { numTeams: settings.numTeams, budget: settings.budget, minBid: settings.minBid, rosterSlots: settings.rosterSlots,
+        categories: (settings.categories || []).map((c) => [c.key, c.higherBetter]) },
+      cfg: { availStrength: cfg.availStrength, scarcityWeight: cfg.scarcityWeight, gpRef: cfg.gpRef, minGp: cfg.minGp },
+      data: { primaryIdx, seasons: (seasons || []).map((s) => ({ label: s.label, players: (s.players || []).map((p) => FINGERPRINT_FIELDS.map((f) => p[f])) })) },
+      gpOverrides: gpOv,
+    }));
+  }
+  /** 個人化指紋:只影響「對我的價值」與推薦,不影響全域價值。 */
+  function personalFingerprint(cfg) {
+    cfg = cfg || {};
+    return fnv1a(stableStringify({ catWeights: cfg.catWeights || {}, needBeta: cfg.needBeta, benchWeight: cfg.benchWeight, strategy: cfg.strategy }));
+  }
+
+  // ------------------------------------------------------------------ Stable Player Identity (Phase 4,C9)
+  // 優先使用資料來源自己的穩定鍵 (Yahoo 的 .p.<球員編號>,跨球季不變);沒有時使用正規化姓名。
+  // 同一份資料裡的同名衝突會以球隊區分並回報,不會默默合併。既有的 pid 欄位完全不動。
+  const SOURCE_KEY_RE = /^([A-Za-z0-9_-]+)\.p\.(\d+)$/;
+  function sourceKeyOf(pid) {
+    const m = SOURCE_KEY_RE.exec(String(pid == null ? '' : pid));
+    if (!m) return null;
+    return (/^\d+$/.test(m[1]) ? 'yahoo' : m[1].toLowerCase()) + ':' + m[2];
+  }
+  function nameKeyOf(name) { return 'name:' + normName(name); }
+  function assignStableIds(list) {
+    const byName = new Map();
+    (list || []).forEach((p) => {
+      p.nameKey = nameKeyOf(p.name);
+      const sk = sourceKeyOf(p.pid);
+      if (sk) { p.sid = sk; p.sidBasis = 'source'; return; }
+      if (!byName.has(p.nameKey)) byName.set(p.nameKey, []);
+      byName.get(p.nameKey).push(p);
+    });
+    const collisions = [];
+    byName.forEach((group, key) => {
+      if (group.length === 1) { group[0].sid = key; group[0].sidBasis = 'name'; return; }
+      const seen = new Map();
+      group.forEach((p) => {
+        let id = `${key}|${String(p.team || '').trim().toLowerCase() || '?'}`;
+        const n = (seen.get(id) || 0) + 1; seen.set(id, n);
+        if (n > 1) id += `#${n}`;
+        p.sid = id; p.sidBasis = 'name+team';
+      });
+      collisions.push({ nameKey: key, names: group.map((p) => p.name), sids: group.map((p) => p.sid) });
+    });
+    return { collisions };
+  }
+
+  /** 找出某球員的手動調整:先用 sid,找不到再用 nameKey (跨來源的同一人)。回傳附上 matchedBy 的副本,不修改原資料。 */
+  function overrideFor(state, p) {
+    const o = state && state.overrides;
+    if (!o || !p) return null;
+    if (p.sid && o[p.sid]) return Object.assign({ matchedBy: 'sid', key: p.sid }, o[p.sid]);
+    if (p.nameKey && p.nameKey !== p.sid && o[p.nameKey]) return Object.assign({ matchedBy: 'nameKey', key: p.nameKey }, o[p.nameKey]);
+    return null;
+  }
+
+  /** 單一類別的原始貢獻值:計數類別直接取值;比率類別 = 命中數 − 聯盟命中率 × 出手數 (出手量加權)。 */
+  function catRaw(c, p, base) {
+    const s = RATIO_SPECS[c.key];
+    return s ? p[s[0]] - base[c.key] * p[s[1]] : p[c.key];
+  }
 
   function buildModel(players, settings, cfg) {
-    cfg = Object.assign({ gpWeight: 0.3, gpRef: 70, minGp: 15 }, cfg || {});
+    cfg = Object.assign({ gpRef: 70, minGp: 15, availStrength: 1, scarcityWeight: 0.20 }, cfg || {});
     const cats = settings.categories, notes = [];
     if (!cats.length) throw new Error('請至少選擇一個統計類別。');
     const df = players.map((p) => Object.assign({}, p));
+    const identity = assignStableIds(df);
+    identity.collisions.forEach((c) => notes.push(`同名球員「${c.names[0]}」出現 ${c.names.length} 次,已以球隊區分 (${c.sids.join(', ')})。`));
 
     for (const c of cats) { // 補齊資料
       const spec = RATIO_SPECS[c.key];
@@ -549,18 +1108,19 @@ window.ROOKIE_POOL = [
     const poolN = nTeams * (nActive + Math.floor(benchSlots(settings) / 2));
 
     let pool = validIdx.slice(), base = {}, z = null, total = null;
+    const catMu = cats.map(() => 0), catSd = cats.map(() => 1);   // 最後一輪的尺度,供 scoreStatLine 以同一尺度計分
     for (let it = 0; it < 6; it++) {
       for (const c of cats) {
         const s = RATIO_SPECS[c.key];
         if (s) base[c.key] = sum(pool.map((i) => df[i][s[0]])) / Math.max(sum(pool.map((i) => df[i][s[1]])), 1e-9);
       }
-      z = cats.map((c) => {
-        const s = RATIO_SPECS[c.key];
-        const raw = df.map((p, i) => (valid[i] ? (s ? p[s[0]] - base[c.key] * p[s[1]] : p[c.key]) : NaN));
+      z = cats.map((c, ci) => {
+        const raw = df.map((p, i) => (valid[i] ? catRaw(c, p, base) : NaN));
         const vals = pool.map((i) => raw[i]);
         const mu = sum(vals) / vals.length;
         let sd = Math.sqrt(sum(vals.map((v) => (v - mu) * (v - mu))) / vals.length);
         if (sd === 0) sd = 1;
+        catMu[ci] = mu; catSd[ci] = sd;
         return raw.map((v) => (c.higherBetter ? 1 : -1) * ((v - mu) / sd));
       });
       total = df.map((_, i) => (valid[i] ? sum(cats.map((_c, ci) => z[ci][i])) : null));
@@ -570,30 +1130,77 @@ window.ROOKIE_POOL = [
       pool = ranked;
     }
 
+    // (1) 基礎分數 → (2) 出勤調整 (§7,sign-safe,C2 可調強度) → (3) 聯盟位置稀缺 (§8,C3)
     df.forEach((p, i) => {
       p.valid = valid[i];
       p.zv = valid[i] ? cats.map((_c, ci) => z[ci][i]) : null;
       p.zTotal = valid[i] ? total[i] : null;
-      p.gpFactor = Math.min((isNum(p.gp) ? p.gp : cfg.gpRef) / cfg.gpRef, 1);
-      p.value = valid[i] ? gpAdjust(total[i], p.gpFactor, cfg.gpWeight) : null;
+      p.baseScore = p.zTotal;
+      p.gpFactor = Math.min((isNum(p.gp) ? p.gp : cfg.gpRef) / cfg.gpRef, 1);   // 僅供「出賽偏少」提示,不再進估值
+      p.availMult = HM.effectiveAvailability(p.availabilityMultiplier, cfg.availStrength);
+      p.riskScore = valid[i] ? HM.applyAvailability(total[i], p.availMult) : null;
       p.posSet = expandPositions(p.pos);
+      p.assignmentLoss = 0; p.scarcityBonus = 0;
     });
-    const ranked = df.filter((p) => p.valid).map((p) => p.value).sort((a, b) => b - a);
-    const nStarters = nTeams * nActive;
-    const replZ = ranked.length ? ranked[Math.min(nStarters, ranked.length - 1)] : 0;
+    // C3 / C4:專屬位置名額 = 隊數 × 每隊該位置名額;UTIL / BN / IL 不產生稀缺。
+    const DEDICATED = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C'];
+    const slotCaps = {};
+    DEDICATED.forEach((pos) => { const n = settings.rosterSlots[pos] || 0; if (n > 0) slotCaps[pos] = n * nTeams; });
+    const validRows = df.filter((p) => p.valid);
+    const withPos = validRows.filter((p) => DEDICATED.some((pos) => slotCaps[pos] && p.posSet.has(pos))).length;
+    let scarcity = { applied: false, reason: '' };
+    if (!Object.keys(slotCaps).length) scarcity.reason = '陣容沒有專屬位置名額 (例如全部是 UTIL),不做聯盟位置稀缺調整。';
+    else if (withPos < validRows.length * 0.5) scarcity.reason = `只有 ${withPos}/${validRows.length} 名球員有位置資料,已跳過聯盟位置稀缺調整 (建議 CSV 加入 Pos 欄)。`;
+    else {
+      const res = HM.computeLeagueScarcity(validRows.map((p) => ({ id: p.pid, eligible: p.posSet, score: p.riskScore })), slotCaps);
+      validRows.forEach((p) => { p.assignmentLoss = res.losses.get(p.pid) || 0; p.scarcityBonus = cfg.scarcityWeight * p.assignmentLoss; });
+      scarcity = { applied: true, filled: res.filled, totalSlots: res.totalSlots, feasible: res.feasible, infeasibleIds: res.infeasibleIds };
+      if (!res.feasible) scarcity.reason = `專屬位置名額 ${res.totalSlots} 個,合格球員只能填滿 ${res.filled} 個;部分位置深度不足,稀缺加成可能偏高。`;
+    }
+    if (scarcity.reason) notes.push(scarcity.reason);
+    df.forEach((p) => { p.value = p.valid ? p.riskScore + p.scarcityBonus : null; });
+
+    // (4) 替補線 (C4):完整名額池 = 隊數 × 每隊總名額 (先發含 UTIL/G/F + 板凳,不含 IL)
+    const ranked = validRows.map((p) => p.value).sort((a, b) => b - a);
+    const nPool = nTeams * rosterSize(settings);
+    const replZ = ranked.length ? ranked[Math.min(nPool, ranked.length - 1)] : 0;
+    const starterLine = ranked.length ? ranked[Math.min(nTeams * nActive, ranked.length - 1)] : 0;   // 先發線 (run 偵測的「先發級」門檻)
     const varSum = sum(ranked.map((v) => Math.max(v - replZ, 0)));
     const poolMoney = nTeams * (settings.budget - rosterSize(settings) * settings.minBid);
     const k = varSum > 0 ? poolMoney / varSum : 0;
     const model = {
-      cats, k, replZ, minBid: settings.minBid, gpWeight: cfg.gpWeight, baselines: base, notes, settings,
+      cats, k, replZ, nPool, starterLine, slotCaps, scarcity, minBid: settings.minBid, availStrength: cfg.availStrength, baselines: base, notes, settings,
+      catStats: cats.map((c, i) => ({ key: c.key, label: c.label, mu: catMu[i], sd: catSd[i], higherBetter: c.higherBetter })),
       toDollars(zz) { return this.minBid + Math.max(zz - this.replZ, 0) * this.k; },
-      gpAdjust(zz, f) { return gpAdjust(zz, f, this.gpWeight); },
+      /** 個人化分數用的出勤調整 (與全域同一套係數,不重複計算)。 */
+      riskAdjust(zz, availMult) { return HM.applyAvailability(zz, availMult); },
     };
-    df.forEach((p) => { p.dollars = p.valid ? model.toDollars(p.value) : null; });
+    df.forEach((p) => {
+      p.dollars = p.valid ? model.toDollars(p.value) : null;
+      p.aboveRepl = p.valid ? p.value - replZ : null;   // UI 顯示用,避免在 UI 層自行相減
+      // Phase 3 風險分層 (C8:傷病 status 只顯示,不進任何一層)。三層的稀缺加成相同,差別只在出勤調整。
+      //   base         = 不做出勤調整
+      //   availability = 只依歷史出勤 (不含手動調整)
+      //   risk         = 再加上使用者明確輸入的手動 GP 調整 = 實際定價用的 value / dollars
+      if (!p.valid) { p.valueTiers = null; return; }
+      // 經由管線時一定有 historicalAvailabilityMultiplier (可能為 null = 沒有歷史);直接呼叫 buildModel 時沒有,就退回 availabilityMultiplier
+      const histMult = p.historicalAvailabilityMultiplier !== undefined ? p.historicalAvailabilityMultiplier : p.availabilityMultiplier;
+      const availScore = HM.applyAvailability(p.baseScore, HM.effectiveAvailability(histMult, cfg.availStrength));
+      const tier = (score, source) => ({ score, dollars: model.toDollars(score + p.scarcityBonus), source });
+      p.valueTiers = {
+        base: tier(p.baseScore, 'calculated'),
+        availability: tier(availScore, 'calculated'),
+        risk: tier(p.riskScore, p.manualGpAdjustment ? 'calculated + user override' : 'calculated'),
+      };
+    });
     df.sort((a, b) => (b.valid ? b.value : -Infinity) - (a.valid ? a.value : -Infinity));
     df.forEach((p, i) => { p.rank = p.valid ? i + 1 : null; });
     model.players = df;
     model.byId = new Map(df.map((p) => [p.pid, p]));
+    model.bySid = new Map(df.map((p) => [p.sid, p]));
+    model.identity = identity;
+    model.modelVersion = VALUATION_MODEL_VERSION; model.decisionVersion = DECISION_MODEL_VERSION;
+    model.configFingerprint = null;   // 由 buildValuationPipeline 填入 (需要原始資料)
     return model;
   }
 
@@ -601,6 +1208,10 @@ window.ROOKIE_POOL = [
   class DraftState {
     constructor(settings, model, teams, myKey) {
       this.settings = settings; this.model = model; this.teams = teams; this.myKey = myKey; this.picks = [];
+      this.overrides = {};   // Phase 4:{ [sid]: { valueAdjustment, gpAdjustment, targetPrice, doNotDraft, priority } }
+      this.currentAuction = null;   // Phase 4 (C10)
+      this.cfg = null;              // 快照計算「我的」個人化價值時使用;未設定時用預設值
+      this.snapshotsEnabled = true; // 模擬用的複本會關閉 (快照只用於真實成交)
     }
     get(pid) { return this.model.byId.get(pid); }
     teamName(key) { const t = this.teams.find((x) => x.key === key); return t ? t.name : key; }
@@ -629,12 +1240,113 @@ window.ROOKIE_POOL = [
     ensurePlayer(pid) {
       if (this.model.byId.has(pid)) return;
       const p = { pid, name: `未知球員(${pid})`, team: '', pos: [], status: '', valid: false, zv: null, value: null, dollars: null, posSet: new Set(), gpFactor: 1, rank: null };
+      p.sid = sourceKeyOf(pid) || 'pid:' + pid; p.nameKey = null; p.sidBasis = 'placeholder';
       this.model.players.push(p); this.model.byId.set(pid, p);
+      if (this.model.bySid && !this.model.bySid.has(p.sid)) this.model.bySid.set(p.sid, p);
+    }
+    getBySid(sid) { return this.model.bySid ? this.model.bySid.get(sid) : undefined; }
+    // ---------------- Phase 4 (C10):進行中的拍賣 (Snake 時只記錄目前考慮的球員)
+    startAuction(pid, opts) {
+      opts = opts || {};
+      if (this.draftedIds().has(pid)) throw new Error('該球員已被選走');
+      this.ensurePlayer(pid);
+      this.currentAuction = { pid, sid: this.get(pid).sid, nominatedBy: opts.nominatedBy || null, currentBid: null, highBidder: null,
+        bids: [], startedAtPick: this.picks.length, status: 'open' };
+      if (this.settings.isAuction && opts.nominatedBy && isNum(Number(opts.openingBid)) && opts.openingBid != null) this.placeBid(opts.nominatedBy, opts.openingBid);
+      return this.currentAuction;
+    }
+    /** 出價必須高於目前叫價;超過該隊合法最高出價只警告不阻擋 (這裡是真實拍賣的鏡像紀錄,合法與否由 Yahoo 判定)。 */
+    placeBid(teamKey, amount) {
+      const a = this.currentAuction;
+      if (!a) throw new Error('目前沒有進行中的拍賣');
+      if (!this.settings.isAuction) throw new Error('Snake 選秀沒有出價');
+      amount = Number(amount);
+      if (!isNum(amount) || amount < this.settings.minBid) throw new Error(`出價至少 ${this.settings.minBid}`);
+      if (a.currentBid != null && amount <= a.currentBid) throw new Error(`出價必須高於目前叫價 ${a.currentBid}`);
+      const warnings = [];
+      if (this.openSpots(teamKey) <= 0) warnings.push(`${this.teamName(teamKey)} 名額已滿`);
+      else if (amount > this.maxBid(teamKey)) warnings.push(`${this.teamName(teamKey)} 出價 ${amount} 超過其最高可出 ${this.maxBid(teamKey)}`);
+      a.bids.push({ teamKey, amount, seq: a.bids.length + 1 });
+      a.currentBid = amount; a.highBidder = teamKey;
+      return { ok: true, warnings };
+    }
+    undoBid() {
+      const a = this.currentAuction;
+      if (!a || !a.bids.length) return null;
+      const b = a.bids.pop(), last = a.bids[a.bids.length - 1];
+      a.currentBid = last ? last.amount : null; a.highBidder = last ? last.teamKey : null;
+      return b;
+    }
+    cancelAuction() { const a = this.currentAuction; this.currentAuction = null; return a; }
+    /** 拍賣:由最高出價者以目前叫價成交;Snake:需指定隊伍 (通常是輪到的隊伍),價格 0。 */
+    completeAuction(teamKey) {
+      const a = this.currentAuction;
+      if (!a) throw new Error('目前沒有進行中的拍賣');
+      let team, price;
+      if (this.settings.isAuction) {
+        if (!a.highBidder) throw new Error('沒有任何出價,無法成交');
+        team = a.highBidder; price = a.currentBid;
+      } else {
+        if (!teamKey) throw new Error('Snake 成交需要指定隊伍');
+        team = teamKey; price = 0;
+      }
+      const pk = this.addPick(a.pid, team, price, 'live');
+      this.currentAuction = null;
+      return pk;
+    }
+    /**
+     * Phase 4 Calibration 快照:在「這一手寫入之前」記錄模型值與預期成交價 (通膨隨每手改變,必須當下記錄)。
+     * 價格區間以「占總預算比例」切分,任何預算的聯盟都適用。沒有估值的球員 (新秀、佔位) 回傳 null。
+     */
+    snapshotFor(pid, teamKey) {
+      const p = this.get(pid), S = this.settings;
+      if (!p || !p.valid || !isNum(p.dollars)) return null;
+      const cfg = this.cfg || defaultCfg();
+      let personalValue = null, myMaxBid = null;
+      const rec = evaluate(this, cfg, buildContext(this, cfg), pid);   // 唯讀:以「這一手之前」的狀態計算我的觀點
+      if (rec) { personalValue = rec.decisionWorth; myMaxBid = S.isAuction ? rec.ceiling : null; }
+      const ov = overrideFor(this, p);
+      const expected = expectedPrice(S, p.dollars, this.inflation());
+      const nT = S.numTeams, nAct = activeSlots(S).length, total = nT * rosterSize(S);
+      const B = S.budget || 200, cut = CALIBRATION.priceCuts.map((f) => Math.round(B * f));
+      const priceRange = expected < cut[0] ? `$${S.minBid}–${cut[0] - 1}` : expected < cut[1] ? `$${cut[0]}–${cut[1] - 1}` : expected < cut[2] ? `$${cut[1]}–${cut[2] - 1}` : `$${cut[2]}+`;
+      const tier = p.rank <= nT * 3 ? `前 ${nT * 3} 名` : (p.rank <= nT * nAct ? '先發級' : '板凳級');
+      const frac = this.picks.length / Math.max(total, 1);
+      let topCat = null;
+      if (p.zv) { let bi = 0; p.zv.forEach((z, i) => { if (z > p.zv[bi]) bi = i; }); topCat = this.model.cats[bi].label; }
+      return {
+        modelVersion: VALUATION_MODEL_VERSION, decisionVersion: DECISION_MODEL_VERSION,
+        configFingerprint: this.model.configFingerprint || null, personalFingerprint: personalFingerprint(cfg), timestamp: new Date().toISOString(),
+        playerValue: p.value, fairValue: p.dollars, marketValue: expected, personalValue, maxBid: myMaxBid,
+        buyerLegalMax: teamKey && S.isAuction ? this.maxBid(teamKey) : null,
+        override: ov ? Object.assign({}, ov) : null,
+        // Phase 4 既有欄位 (保留,相容舊紀錄):modelDollars = fairValue、expectedPrice = marketValue
+        sid: p.sid, modelDollars: p.dollars, expectedPrice: expected, rank: p.rank, primaryPos: (p.pos || [])[0] || null,
+        tier, priceRange, stage: frac < 1 / 3 ? '前段' : (frac < 2 / 3 ? '中段' : '後段'), topCat, at: this.picks.length,
+      };
+    }
+    /**
+     * 還原選秀紀錄 (C9):有 sid 就依 sid 找球員 (pid 若改變會重新綁定);沒有 sid 的舊紀錄照 pid;
+     * 都找不到就建立佔位球員。回傳 { rebound, placeholders }。
+     */
+    restorePicks(picks) {
+      let rebound = 0, placeholders = 0;
+      (picks || []).forEach((raw) => {
+        const pk = Object.assign({}, raw);
+        const bySid = pk.sid ? this.getBySid(pk.sid) : null;
+        if (bySid) {                       // 同一個 sid = 同一個人;pid 改變就重新綁定
+          if (bySid.pid !== pk.pid) { pk.pid = bySid.pid; rebound++; }
+        } else if (!this.model.byId.has(pk.pid)) { this.ensurePlayer(pk.pid); placeholders++; }
+        if (!pk.sid) pk.sid = this.get(pk.pid).sid;
+        this.picks.push(pk);
+      });
+      return { rebound, placeholders };
     }
     addPick(pid, teamKey, price, source) {
       if (this.draftedIds().has(pid)) throw new Error('該球員已被選走');
       this.ensurePlayer(pid);
-      const p = { pid, teamKey, price: Number(price) || 0, pickNo: this.picks.length + 1, source: source || 'manual' };
+      const snap = this.snapshotsEnabled === false ? null : this.snapshotFor(pid, teamKey);
+      const p = { pid, sid: this.get(pid).sid, teamKey, price: Number(price) || 0, pickNo: this.picks.length + 1, source: source || 'manual', snap };
       this.picks.push(p); return p;
     }
     removePick(pid) {
@@ -657,7 +1369,8 @@ window.ROOKIE_POOL = [
           }
         } else {
           this.ensurePlayer(r.playerKey);
-          const np = { pid: r.playerKey, teamKey: r.teamKey, price, pickNo: r.pickNo, source: 'yahoo' };
+          const snap = this.snapshotFor(r.playerKey, r.teamKey);   // 依選秀順序逐筆快照:用前面幾手成交後的狀態
+          const np = { pid: r.playerKey, sid: this.get(r.playerKey).sid, teamKey: r.teamKey, price, pickNo: r.pickNo, source: 'yahoo', snap };
           this.picks.push(np); changes.push({ kind: 'new', pick: np });
         }
       }
@@ -665,6 +1378,11 @@ window.ROOKIE_POOL = [
         if (p.source === 'yahoo' && !remote.has(p.pid)) { this.picks.splice(this.picks.indexOf(p), 1); changes.push({ kind: 'removed', pick: p }); }
       }
       this.picks.sort((a, b) => (a.pickNo || 1e9) - (b.pickNo || 1e9));
+      const cur = this.currentAuction;
+      if (cur && this.draftedIds().has(cur.pid)) {
+        this.currentAuction = null;
+        changes.push({ kind: 'auctionClosed', pick: this.picks.find((pk) => pk.pid === cur.pid), auction: cur });
+      }
       return changes;
     }
   }
@@ -686,15 +1404,19 @@ window.ROOKIE_POOL = [
     return null;
   }
 
+  /** 類別需求向量 (我方與對手共用同一公式):陣容某類別平均 z 越低,需求越高;前 5 人逐步增加可信度。 */
+  function categoryNeed(state, pids) {
+    const cats = state.model.cats, n = pids.length;
+    if (!n) return cats.map(() => 0);
+    const tz = cats.map((_c, i) => sum(pids.map((pid) => { const p = state.get(pid); return p && p.zv ? p.zv[i] : 0; })));
+    return tz.map((t) => clip(-t / n, -1, 1) * Math.min(n / 5, 1));
+  }
+
   function buildContext(state, cfg) {
     const m = state.model, cats = m.cats, S = state.settings;
     const base = cats.map((c) => (isPunt(c, cfg) ? 0 : (cfg.catWeights && cfg.catWeights[c.label] != null ? Number(cfg.catWeights[c.label]) : 1)));
-    const my = state.myIds(), n = my.length;
-    let need = cats.map(() => 0);
-    if (n > 0) {
-      const tz = cats.map((_c, i) => sum(my.map((pid) => { const p = state.get(pid); return p && p.zv ? p.zv[i] : 0; })));
-      need = tz.map((t) => clip(-t / n, -1, 1) * Math.min(n / 5, 1));
-    }
+    const my = state.myIds();
+    const need = categoryNeed(state, my);
     base.forEach((b, i) => { if (b === 0) need[i] = 0; });
     let w = base.map((b, i) => Math.max(b * (1 + cfg.needBeta * need[i]), 0));
     const sw = sum(w);
@@ -703,23 +1425,45 @@ window.ROOKIE_POOL = [
     const active = activeSlots(S);
     const myPos = my.map((pid) => state.get(pid).posSet);
     const matched = maxMatch(active, myPos), unfilled = active.length - matched;
-    let floor = -Infinity;
-    if (my.length && unfilled === 0) {
-      floor = Math.min(...my.map((pid) => { const p = state.get(pid); return m.gpAdjust(p.zv ? dot(p.zv, w) : 0, p.valid ? p.gpFactor : 1); }));
-    }
+    const personal = (p) => (p && p.valid && p.zv ? m.riskAdjust(dot(p.zv, w), p.availMult) : null);
+    let floor = -Infinity;   // 舊版「先發已滿時的最弱球員」;保留欄位供相容,worth 已改用陣容邊際價值
+    if (my.length && unfilled === 0) floor = Math.min(...my.map((pid) => { const v = personal(state.get(pid)); return v == null ? 0 : v; }));
     const avail = state.available();
-    const srt = avail.map((p) => m.gpAdjust(dot(p.zv, w), p.gpFactor)).sort((a, b) => b - a);
+    const srt = avail.map((p) => personal(p)).sort((a, b) => b - a);
     const nOpen = sum(state.teams.map((t) => state.openSpots(t.key)));
-    const R = clip(pyRound((nOpen * active.length) / rosterSize(S)), 1, Math.max(srt.length - 1, 1));
+    // C4:個人化替補線與全域一致,採完整剩餘名額 (而不是只算先發比例)
+    const R = clip(nOpen, 1, Math.max(srt.length - 1, 1));
     const replP = srt.length ? srt[Math.min(R, srt.length - 1)] : m.replZ;
     const varSum = sum(srt.slice(0, R).map((v) => Math.max(v - replP, 0)));
     const mb = S.minBid;
     const cash = sum(state.teams.map((t) => Math.max(state.budgetLeft(t.key) - state.openSpots(t.key) * mb, 0)));
     const kP = varSum > 0 && S.isAuction ? cash / varSum : m.k;
+
+    // C5:陣容價值 = 我方陣容 (相對個人替補線的分數) 以加權最佳指派排進先發名額 (含 UTIL/G/F) + benchWeight × 板凳
+    const rosterCaps = {};
+    active.forEach((slot) => { rosterCaps[slot] = (rosterCaps[slot] || 0) + 1; });
+    const benchWeight = isNum(cfg.benchWeight) ? Math.max(cfg.benchWeight, 0) : 0;
+    const toEntry = (p) => {
+      const v = personal(p);
+      const eligible = new Set(p.posSet); eligible.add('UTIL');
+      return { id: p.pid, eligible, rel: v == null ? 0 : v - replP };   // 沒有估值的球員 (例如新秀) 視為替補級 (0)
+    };
+    const rosterEntries = my.map((pid) => toEntry(state.get(pid)));
+    const rosterNow = HM.rosterAssignmentValue(rosterEntries, rosterCaps, benchWeight, benchSlots(S));
     return {
       w, need, myPos, active, matchedNow: matched, unfilled, spots: state.openSpots(state.myKey), maxBid: state.maxBid(state.myKey),
       infl: state.inflation(), nextPick: nextMyPicks(state, cfg), picksMade: state.picksMade(), floor, replP, kP, cats,
+      rosterCaps, rosterEntries, rosterValueNow: rosterNow.total, benchWeight, toEntry,
+      survivalRef: survivalReference(state, cfg),
     };
+  }
+
+  /** C5:把候選人加入我方陣容後,陣容價值增加多少 (分數單位)。純函式,供 evaluate 與其他服務共用。 */
+  function marginalRosterValue(state, ctx, pid) {
+    const p = state.get(pid);
+    if (!p || !p.valid) return null;
+    const withP = HM.rosterAssignmentValue(ctx.rosterEntries.concat([ctx.toEntry(p)]), ctx.rosterCaps, ctx.benchWeight, benchSlots(state.settings));
+    return Math.max(withP.total - ctx.rosterValueNow, 0);
   }
 
   function strategyParams(cfg, market) {
@@ -731,11 +1475,15 @@ window.ROOKIE_POOL = [
     return [0.90, 0.05];
   }
 
-  function evaluate(state, cfg, ctx, pid) {
+  /**
+   * opts.lite = true:只算排名需要的 score / decisionScore / doNotDraft,在計算陣容邊際價值之前返回
+   * (Snake 的推薦排序只看 decisionScore,不用 MRV;模擬大量重複時使用,結果與完整計算的排序完全相同)。
+   */
+  function evaluate(state, cfg, ctx, pid, opts) {
     const m = state.model, S = state.settings, row = state.get(pid);
     if (!row || !row.valid) return null;
     const z = row.zv;
-    const raw = dot(z, ctx.w), adj = m.gpAdjust(raw, row.gpFactor);
+    const raw = dot(z, ctx.w), adj = m.riskAdjust(raw, row.availMult);
 
     const gain = maxMatch(ctx.active, ctx.myPos.concat([row.posSet])) - ctx.matchedNow;
     const forced = ctx.spots - ctx.unfilled <= 0;
@@ -743,22 +1491,38 @@ window.ROOKIE_POOL = [
     let posAdj = 0;
     if (ctx.unfilled > 0) posAdj = gain ? 0.15 : (ctx.spots > ctx.unfilled + 1 ? -0.6 : -3.0);
     const score = adj + posAdj;
+    // Phase 4 Manual Override:只作用在決策層 (模型值 + 使用者調整 = 最終決策值),不覆寫 worth 與全域價值
+    const ov = overrideFor(state, row);
+    const valueAdj = ov && isNum(ov.valueAdjustment) ? ov.valueAdjustment : 0;
+    const decisionScore = score + (valueAdj && ctx.kP > 0 ? valueAdj / ctx.kP : 0);
+    if (opts && opts.lite) return { pid, score, decisionScore, doNotDraft: !!(ov && ov.doNotDraft), lite: true };
 
-    const lower = ctx.unfilled === 0 ? Math.max(ctx.floor, ctx.replP) : ctx.replP;
-    const worth = S.minBid + Math.max(adj - lower, 0) * ctx.kP;
-    const market = row.dollars, fair = S.minBid + (market - S.minBid) * ctx.infl;
+    // C5:對我的價值由「陣容邊際價值」決定 —— 位置重疊、只能擠掉較強隊友時,價值會自然下降
+    const mrv = marginalRosterValue(state, ctx, pid);
+    const worth = S.minBid + mrv * ctx.kP;
+    const decisionWorth = Math.max(S.minBid, worth + valueAdj);
+    const market = row.dollars, fair = expectedPrice(S, market, ctx.infl);
     const [tf, margin] = strategyParams(cfg, market);
 
     const rec = {
       pid, name: row.name, team: row.team || '', pos: (row.pos || []).join('/'), status: row.status || '', score,
-      var: score - ctx.replP, market, fair, worth, target: null, ceiling: null,
+      var: score - ctx.replP, market, fair, worth, target: null, ceiling: null, mrv,
+      survival: S.isAuction ? null : estimateSurvival(state, cfg, pid, ctx.survivalRef),
+      decisionWorth, decisionScore,
+      doNotDraft: !!(ov && ov.doNotDraft), priority: (ov && ov.priority) || 'normal',
+      override: ov ? { matchedBy: ov.matchedBy, applied: ['valueAdjustment', 'gpAdjustment', 'targetPrice', 'doNotDraft', 'priority'].filter((k) => ov[k] != null && ov[k] !== 0 && ov[k] !== false && ov[k] !== 'normal' && ov[k] !== '') } : null,
       adp: isNum(row.adp) ? row.adp : null, tag: '', reasons: [], gain, contrib: z.map((v, i) => v * ctx.w[i]),
     };
     if (S.isAuction) {
       const cap = Math.max(ctx.maxBid, 0);
-      const ceiling = Math.min(pyRound(worth * (1 + margin)), cap);
+      // C14:放棄上限 = floor(min(策略上限, 合法最高出價)) —— 語意不變,只把四捨五入改成 floor (規格 §18)
+      const ceiling = Math.floor(Math.min(decisionWorth * (1 + margin), cap));
       rec.ceiling = Math.max(ceiling, Math.min(S.minBid, cap));
-      rec.target = Math.max(Math.min(pyRound(worth * tf), pyRound(fair), rec.ceiling), Math.min(S.minBid, cap));
+      rec.target = Math.max(Math.min(pyRound(decisionWorth * tf), pyRound(fair), rec.ceiling), Math.min(S.minBid, cap));
+      if (ov && isNum(ov.targetPrice)) {   // 使用者自訂目標價:直接作為建議出價,上限至少為此價,都不超過合法最高出價
+        rec.target = Math.max(Math.min(Math.floor(ov.targetPrice), cap), Math.min(S.minBid, cap));
+        rec.ceiling = Math.max(rec.ceiling, rec.target);
+      }
     }
     const order = rec.contrib.map((v, i) => i).sort((a, b) => rec.contrib[b] - rec.contrib[a]);
     const top = order.slice(0, 3).filter((i) => rec.contrib[i] >= 0.5).map((i) => `${ctx.cats[i].label}${rec.contrib[i] >= 0 ? '+' : ''}${rec.contrib[i].toFixed(1)}`);
@@ -766,8 +1530,15 @@ window.ROOKIE_POOL = [
     const weak = ctx.need.map((v, i) => i).sort((a, b) => ctx.need[b] - ctx.need[a]).slice(0, 2).filter((i) => ctx.need[i] > 0.25 && z[i] > 0.3).map((i) => ctx.cats[i].label);
     if (weak.length) rec.reasons.push('補強 ' + weak.join('、'));
     if (ctx.unfilled > 0 && gain) rec.reasons.push('可補先發位置');
+    const own = Math.max(adj - ctx.replP, 0);
+    if (own - mrv > 0.5) rec.reasons.push(`與陣容位置重疊,邊際價值 ${mrv.toFixed(1)} (自身 ${own.toFixed(1)})`);
+    if (row.availMult < 0.97) rec.reasons.push(`出勤調整 ×${row.availMult.toFixed(2)}`);
     if (row.gpFactor < 0.8) rec.reasons.push(`出賽偏少(${Math.trunc(row.gp)}場)`);
     if (rec.status && rec.status !== 'NA') rec.reasons.push(`傷病:${rec.status}`);
+    if (rec.doNotDraft) rec.reasons.push('你已標記為不選 (手動)');
+    if (valueAdj) rec.reasons.push(`手動價值調整 ${valueAdj > 0 ? '+' : ''}${valueAdj} (決策值 ${Math.round(decisionWorth)})`);
+    if (ov && isNum(ov.targetPrice) && S.isAuction) rec.reasons.push(`手動目標價 ${Math.floor(ov.targetPrice)}`);
+    if (rec.survival) rec.reasons.push(`估計撐到 #${rec.survival.targetPick}:${Math.round(rec.survival.estimate * 100)}% (模型估計,依${rec.survival.basis})`);
     if (!S.isAuction && rec.adp !== null && ctx.nextPick) {
       const [p1, p2] = ctx.nextPick;
       if (rec.adp >= p2 + 3) { rec.tag = '可等下輪'; rec.reasons.push(`ADP ${Math.round(rec.adp)} 晚於我再下次順位 #${p2},可先選別人`); }
@@ -780,20 +1551,184 @@ window.ROOKIE_POOL = [
     n = n || cfg.nRecs || 5;
     const ctx = buildContext(state, cfg), S = state.settings;
     if (ctx.spots <= 0) return { recs: [], ctx };
-    const pre = state.available().map((p) => ({ p, s: dot(p.zv, ctx.w) })).sort((a, b) => b.s - a.s).slice(0, 80);
-    let cands = pre.map((x) => evaluate(state, cfg, ctx, x.p.pid)).filter(Boolean);
+    // C6:不再先用原始分數截取前 80 名;先對全部可選球員計算指標,再排除不可能的選項,最後排序。
+    let cands = state.available().map((p) => evaluate(state, cfg, ctx, p.pid)).filter((c) => c && !c.doNotDraft);
     if (S.isAuction) cands = cands.filter((c) => c.fair <= ctx.maxBid + 0.5);
-    cands.sort((a, b) => b.score - a.score);
+    cands.sort((a, b) => b.decisionScore - a.decisionScore);
     if (!cands.length) return { recs: [], ctx };
     if (!S.isAuction) return { recs: cands.slice(0, n), ctx };
 
     const k = Math.ceil(n / 2), chosen = cands.slice(0, k);
     chosen.forEach((c) => { c.tag = '核心目標'; });
     const rest = cands.slice(k);
-    const bargains = rest.filter((c) => c.fair >= 3 && c.worth > c.fair).sort((a, b) => b.worth / b.fair - a.worth / a.fair);
+    const bargains = rest.filter((c) => c.fair >= 3 && c.decisionWorth > c.fair).sort((a, b) => b.decisionWorth / b.fair - a.decisionWorth / a.fair);
     for (const c of bargains) if (chosen.length < n) { c.tag = '高CP值'; chosen.push(c); }
     for (const c of rest) { if (chosen.length >= n) break; if (!chosen.includes(c)) chosen.push(c); }
     return { recs: chosen, ctx };
+  }
+
+  // ================================================================== 決策層 (Phase 2)
+  // 所有輸出都標示資料性質:observed (實際紀錄) / calculated (確定公式) / heuristic (啟發式估計)。
+  // 威脅與提名都是 heuristic:權重與門檻寫成具名常數,每個結果都附上各因素的原始數值,方便使用者自行判斷。
+
+  /** 預期成交價 (= rec.fair,規格的 Market $):最低價不通膨,只有溢價部分乘上通膨。 */
+  function expectedPrice(settings, dollars, infl) {
+    return settings.minBid + (dollars - settings.minBid) * (isNum(infl) ? infl : 1);
+  }
+
+  const THREAT_WEIGHTS = { position: 0.5, category: 0.3, urgency: 0.2 };   // heuristic
+  const THREAT_LEVELS = { high: 0.6, medium: 0.35 };                        // heuristic
+  const BENCH_ONLY_POSITION_FACTOR = 0.3;                                    // heuristic:只能進板凳時的位置因子
+  const NOMINATION = { tierShare: 0.30, burnWorthRatio: 0.8, burnMinCompetitors: 2, avoidMinGap: 3, avoidGapRatio: 0.2, targetMinOverMin: 2 };
+
+  function threatLevel(score) {
+    if (!(score > 0)) return 'NONE';
+    return score >= THREAT_LEVELS.high ? 'HIGH' : (score >= THREAT_LEVELS.medium ? 'MEDIUM' : 'LOW');
+  }
+
+  /**
+   * 對手模型:每隊的預算、名額、最高出價、已選球員、位置缺口、類別需求、可能目標,以及聯盟各位置的供需。
+   * 對手的類別需求用與我方相同的 categoryNeed();對手的 Punt 與類別偏好無從得知,一律假設為等權 (假設)。
+   */
+  function buildOpponentModel(state, cfg) {
+    const S = state.settings, m = state.model, cats = m.cats, active = activeSlots(S);
+    const infl = state.inflation();
+    const avail = state.available();
+    const teams = state.teams.map((t) => {
+      const pids = state.roster(t.key).map((p) => p.pid);
+      const posSets = pids.map((pid) => state.get(pid).posSet);
+      const { count, matchSlot } = matchDetail(active, posSets);
+      const openStarterSlots = active.filter((_slot, i) => matchSlot[i] === -1);
+      const need = categoryNeed(state, pids);
+      let w = need.map((nd) => Math.max(1 + (cfg.needBeta || 0) * nd, 0));
+      const sw = sum(w); if (sw > 0) w = w.map((x) => (x * cats.length) / sw);
+      const positionNeeds = {};
+      openStarterSlots.forEach((slot) => { positionNeeds[slot] = (positionNeeds[slot] || 0) + 1; });
+      const ctx = {
+        key: t.key, name: t.name, isMe: t.key === state.myKey, pids, posSets, matched: count,
+        starterOpen: openStarterSlots.length, openSpots: state.openSpots(t.key),
+        budgetLeft: S.isAuction ? state.budgetLeft(t.key) : null, maxBid: S.isAuction ? state.maxBid(t.key) : null,
+        need, w, positionNeeds,
+        categoryNeeds: cats.map((c, i) => ({ label: c.label, need: need[i] })).filter((x) => x.need > 0.25).sort((a, b) => b.need - a.need),
+      };
+      // 可能目標:對方的需求權重下分數最高、能補對方先發缺口 (若有缺口)、且買得起預期價的可選球員
+      ctx.likelyTargets = ctx.openSpots <= 0 ? [] : avail
+        .filter((p) => (ctx.starterOpen > 0 ? maxMatch(active, posSets.concat([p.posSet])) > count : true))
+        .filter((p) => !S.isAuction || expectedPrice(S, p.dollars, infl) <= ctx.maxBid)
+        .map((p) => ({ pid: p.pid, name: p.name, score: m.riskAdjust(dot(p.zv, w), p.availMult) }))
+        .sort((a, b) => b.score - a.score).slice(0, 3);
+      return ctx;
+    });
+    // 聯盟層級的位置供需 (不含 UTIL/BN):供給 = 可選且高於替補線的球員數;需求 = 各隊尚未填的該位置先發名額
+    const positions = Object.keys(m.slotCaps || {}).map((pos) => ({
+      pos,
+      openSlots: sum(teams.map((t) => t.positionNeeds[pos] || 0)),
+      teamsNeeding: teams.filter((t) => (t.positionNeeds[pos] || 0) > 0).length,
+      supplyAboveRepl: avail.filter((p) => p.posSet.has(pos) && p.value >= m.replZ).length,
+    }));
+    return { teams, positions, infl, source: 'observed + heuristic' };
+  }
+
+  /** 單一對手對某球員的威脅 (heuristic)。threat = 預算能力 × (0.5 位置 + 0.3 類別 + 0.2 先發急迫度)。 */
+  function threatFor(state, teamCtx, p, price) {
+    const S = state.settings, active = activeSlots(S);
+    if (!teamCtx || teamCtx.openSpots <= 0 || !p || !p.valid) {
+      return { score: 0, level: 'NONE', canAfford: false, fillsStarter: false, factors: { budget: 0, position: 0, category: 0, urgency: 0 } };
+    }
+    const budget = S.isAuction ? (teamCtx.maxBid >= price ? 1 : clip(teamCtx.maxBid / Math.max(price, 1e-9), 0, 1)) : 1;
+    const fillsStarter = maxMatch(active, teamCtx.posSets.concat([p.posSet])) > teamCtx.matched;
+    const position = fillsStarter ? 1 : (teamCtx.openSpots > teamCtx.starterOpen ? BENCH_ONLY_POSITION_FACTOR : 0);
+    const num = sum(p.zv.map((z, i) => teamCtx.need[i] * z)), den = sum(p.zv.map((z) => Math.abs(z)));
+    const category = clip(0.5 + 0.5 * (den > 0 ? num / den : 0), 0, 1);   // 沒有需求資訊時為中性 0.5
+    const urgency = active.length ? teamCtx.starterOpen / active.length : 0;
+    const score = budget * (THREAT_WEIGHTS.position * position + THREAT_WEIGHTS.category * category + THREAT_WEIGHTS.urgency * urgency);
+    return { score, level: threatLevel(score), canAfford: budget >= 1, fillsStarter, factors: { budget, position, category, urgency } };
+  }
+
+  /** 目前這名球員:誰可能跟我搶?回傳依威脅排序的對手清單與摘要。 */
+  function analyzeThreat(state, cfg, pid, opp) {
+    const p = state.get(pid);
+    if (!p || !p.valid) return null;
+    opp = opp || buildOpponentModel(state, cfg);
+    const price = expectedPrice(state.settings, p.dollars, opp.infl);
+    const rows = opp.teams.filter((t) => !t.isMe).map((t) => Object.assign({
+      teamKey: t.key, teamName: t.name, budgetLeft: t.budgetLeft, maxBid: t.maxBid, openSpots: t.openSpots, starterOpen: t.starterOpen,
+      needCats: t.categoryNeeds.map((x) => x.label),
+    }, threatFor(state, t, p, price))).sort((a, b) => b.score - a.score);
+    const summary = {
+      high: rows.filter((r) => r.level === 'HIGH').length,
+      medium: rows.filter((r) => r.level === 'MEDIUM').length,
+      capable: rows.filter((r) => r.canAfford && (r.level === 'HIGH' || r.level === 'MEDIUM')).length,
+    };
+    return { pid, expectedPrice: price, rows, summary, source: 'heuristic' };
+  }
+
+  /** 拍賣提名助手 (heuristic):自己要的 (target)、消耗對手預算 (burn)、不適合自己出手 (avoid)。 */
+  function nominationAdvice(state, cfg, n, opp) {
+    const S = state.settings;
+    n = n || 5;
+    const empty = { available: false, target: [], burn: [], avoid: [], source: 'heuristic' };
+    if (!S.isAuction) return Object.assign(empty, { reason: '提名建議只適用拍賣選秀。' });
+    const ctx = buildContext(state, cfg);
+    if (ctx.spots <= 0) return Object.assign(empty, { reason: '你的陣容已滿。' });
+    opp = opp || buildOpponentModel(state, cfg);
+    const rows = state.available().map((p) => {
+      const rec = evaluate(state, cfg, ctx, p.pid);
+      const price = expectedPrice(S, p.dollars, opp.infl);
+      const worth = rec ? rec.decisionWorth : S.minBid;
+      const th = analyzeThreat(state, cfg, p.pid, opp);
+      return { p, rec, price, worth, gap: worth - price, mrv: rec ? rec.mrv : 0, comp: th.summary };
+    });
+    const prices = rows.map((r) => r.price).filter((x) => x > S.minBid).sort((a, b) => b - a);
+    const tierCut = prices.length ? prices[Math.min(Math.floor(prices.length * NOMINATION.tierShare), prices.length - 1)] : Infinity;
+    const item = (r, kind, reasons) => ({
+      kind, pid: r.p.pid, name: r.p.name, pos: (r.p.pos || []).join('/'), expectedPrice: r.price, worth: r.worth, valueGap: r.gap,
+      mrv: r.mrv, competitors: r.comp, reasons, source: 'heuristic',
+    });
+    const compText = (c) => `能出到預期價且有需求的對手 ${c.capable} 隊 (高威脅 ${c.high})`;
+    const target = rows
+      .filter((r) => r.rec && !r.rec.doNotDraft && r.price <= ctx.maxBid && r.price >= S.minBid + NOMINATION.targetMinOverMin && r.gap >= 0)
+      .sort((a, b) => (b.gap - a.gap) || (a.comp.capable - b.comp.capable)).slice(0, n)
+      .map((r) => item(r, 'target', [`對我價值 ${Math.round(r.worth)} ≥ 預期成交 ${Math.round(r.price)} (差 +${Math.round(r.gap)})`, `陣容邊際價值 ${r.mrv.toFixed(1)}`, compText(r.comp)]));
+    const burn = rows
+      .filter((r) => r.price >= tierCut && r.worth <= NOMINATION.burnWorthRatio * r.price && r.comp.capable >= NOMINATION.burnMinCompetitors)
+      .sort((a, b) => b.price * b.comp.capable - a.price * a.comp.capable).slice(0, n)
+      .map((r) => item(r, 'burn', [`預期成交 ${Math.round(r.price)},屬於剩餘球員中高價的前 ${Math.round(NOMINATION.tierShare * 100)}%`, compText(r.comp), `對我價值只有 ${Math.round(r.worth)};若無人加價,你會以提名價得標`]));
+    const burnIds = new Set(burn.map((x) => x.pid));
+    const avoid = rows
+      .filter((r) => !burnIds.has(r.p.pid) && r.price >= tierCut && (r.price - r.worth) >= Math.max(NOMINATION.avoidMinGap, NOMINATION.avoidGapRatio * r.price))
+      .sort((a, b) => (b.price - b.worth) - (a.price - a.worth)).slice(0, n)
+      .map((r) => item(r, 'avoid', [`預期成交 ${Math.round(r.price)},對我價值 ${Math.round(r.worth)} (差 ${Math.round(r.worth - r.price)})`, r.rec && r.mrv < Math.max((r.rec.var || 0), 0) - 0.5 ? '與陣容位置重疊,邊際價值低' : '對目前陣容/預算的邊際價值低', compText(r.comp)]));
+    return { available: true, target, burn, avoid, tierCut, source: 'heuristic' };
+  }
+
+  /**
+   * 四軌推薦:A 最佳球員 (全域價值) / B 最佳 CP (對我價值 − 預期成交;Snake 用 ADP 與模型排名差) /
+   * C 最佳陣容補強 (陣容邊際價值) / D 提名目標 (僅拍賣)。每一軌都先對全部可選球員計算指標,再排除不可能選項,最後排序。
+   */
+  function recommendTracks(state, cfg, n) {
+    n = n || cfg.nRecs || 5;
+    const S = state.settings, ctx = buildContext(state, cfg);
+    const out = { bestPlayer: [], bestValue: [], bestFit: [], nomination: [], notes: {}, ctx };
+    if (ctx.spots <= 0) { out.notes.all = '你的陣容已滿。'; return out; }
+    let recs = state.available().map((p) => evaluate(state, cfg, ctx, p.pid)).filter((r) => r && !r.doNotDraft);
+    if (S.isAuction) recs = recs.filter((r) => r.fair <= ctx.maxBid + 0.5);
+    const withMetric = (r, label, value) => Object.assign({}, r, { metric: { label, value } });
+    out.bestPlayer = recs.slice().sort((a, b) => state.get(b.pid).value - state.get(a.pid).value).slice(0, n)
+      .map((r) => withMetric(r, '全域價值', state.get(r.pid).value));
+    if (S.isAuction) {
+      out.bestValue = recs.filter((r) => r.fair >= S.minBid + 1).sort((a, b) => (b.decisionWorth - b.fair) - (a.decisionWorth - a.fair)).slice(0, n)
+        .map((r) => withMetric(r, '對我價值 − 預期成交', r.decisionWorth - r.fair));
+    } else {
+      const withAdp = recs.filter((r) => r.adp != null);
+      if (!withAdp.length) out.notes.bestValue = '目前資料沒有 ADP,Snake 模式無法計算 CP 值 (模型排名 vs 市場順位)。';
+      out.bestValue = withAdp.map((r) => ({ r, gap: r.adp - state.get(r.pid).rank })).sort((a, b) => b.gap - a.gap).slice(0, n)
+        .map((x) => withMetric(x.r, 'ADP − 模型排名', x.gap));
+    }
+    out.bestFit = recs.slice().sort((a, b) => b.mrv - a.mrv).slice(0, n).map((r) => withMetric(r, '陣容邊際價值', r.mrv));
+    if (S.isAuction) out.nomination = nominationAdvice(state, cfg, n).target;
+    else out.notes.nomination = '提名建議只適用拍賣選秀。';
+    return out;
   }
 
   // ------------------------------------------------------------------ 跨季比較 / 新秀
@@ -815,8 +1750,10 @@ window.ROOKIE_POOL = [
       if (seen.has(pid)) continue;
       const row = { pid, name: r.name, team: r.team || '', pos: r.pos || [], status: '', valid: false,
                     zv: null, value: null, dollars: null, gp: null, gpFactor: 1, rank: null, adp: null,
-                    posSet: expandPositions(r.pos || []), isRookie: true, rookieMeta: r };
+                    posSet: expandPositions(r.pos || []), isRookie: true, rookieMeta: r,
+                    sid: nameKeyOf(r.name), nameKey: nameKeyOf(r.name), sidBasis: 'name' };
       model.players.push(row); model.byId.set(pid, row); seen.add(pid);
+      if (model.bySid && !model.bySid.has(row.sid)) model.bySid.set(row.sid, row);
     }
   }
 
@@ -856,6 +1793,556 @@ window.ROOKIE_POOL = [
       const pk = state.picks.find((p) => p.pid === pid);
       return Object.assign({}, r, { pid, draftedBy: pk ? state.teamName(pk.teamKey) : null, isMine: !!pk && pk.teamKey === state.myKey });
     });
+  }
+
+  // ------------------------------------------------------------------ 現場模式 (Phase 4,Draft Day Mode)
+  /** 蛇形選秀順序:其他隊依 draftPosition;若設定了 myDraftSlot,把我方放到該順位 (與 nextMyPicks 一致)。 */
+  function draftOrder(state, cfg) {
+    const order = state.teams.slice().sort((a, b) => (a.draftPosition || 99) - (b.draftPosition || 99));
+    const mySlot = cfg && cfg.myDraftSlot;
+    if (mySlot) {
+      const i = order.findIndex((t) => t.key === state.myKey);
+      if (i >= 0) { const [me] = order.splice(i, 1); order.splice(clip(mySlot, 1, order.length + 1) - 1, 0, me); }
+    }
+    return order;
+  }
+  function teamOnClock(state, cfg) {
+    if (state.settings.isAuction) return null;
+    const order = draftOrder(state, cfg), n = order.length, k = state.picksMade();
+    const r = Math.floor(k / n), i = k % n;
+    return order[r % 2 === 0 ? i : n - 1 - i] || null;
+  }
+
+  const LIVE = { snakeMidTopN: 3, nextTargets: 5 };
+  /**
+   * 目前這名球員的現場決策:BUY / WAIT / PASS。
+   * 拍賣:直接沿用 bidVerdict (低於建議價 BUY、溢價區 WAIT、達上限 PASS),不另立規則。
+   * Snake (heuristic):撐到下一次的估計 < 40% → BUY、> 70% → WAIT;中間時陣容邊際價值前 3 名 → BUY,否則 WAIT。
+   * 下一批目標:高優先 (手動標記) 在前,其餘依陣容邊際價值,排除目前球員與「不選」。
+   */
+  function liveDecision(state, cfg) {
+    const a = state.currentAuction;
+    if (!a) return null;
+    const p = state.get(a.pid);
+    if (!p) return null;
+    const S = state.settings, ctx = buildContext(state, cfg);
+    const rec = p.valid ? evaluate(state, cfg, ctx, a.pid) : null;
+    const evals = state.available().map((x) => (x.pid === a.pid ? rec : evaluate(state, cfg, ctx, x.pid)))
+      .filter((r) => r && !r.doNotDraft && (!S.isAuction || r.fair <= ctx.maxBid + 0.5));
+    const reasons = [];
+    let decision = null;
+    if (!p.valid) reasons.push('沒有估值資料 (例如新秀),請自行判斷。');
+    else if (!rec) { decision = 'PASS'; reasons.push(ctx.spots <= 0 ? '你的陣容已滿。' : '加入後無法湊齊先發位置。'); }
+    else if (rec.doNotDraft) { decision = 'PASS'; reasons.push('你已標記為不選 (手動)。'); }
+    else if (S.isAuction) {
+      const bid = a.currentBid == null ? 0 : a.currentBid;
+      if (a.highBidder === state.myKey) { decision = 'BUY'; reasons.push(`你目前是最高出價者 (${a.currentBid}),不需要動作。`); }
+      else if (bid >= ctx.maxBid) { decision = 'PASS'; reasons.push(`目前叫價 ${bid} 已達你的合法最高出價 ${ctx.maxBid}。`); }
+      else {
+        const v = bidVerdict(rec, bid);
+        decision = { cheap: 'BUY', premium: 'WAIT', stop: 'PASS' }[v];
+        reasons.push({ cheap: `叫價 ${bid} 低於建議出價 ${rec.target},可以繼續加。`, premium: `叫價 ${bid} 已在溢價區 (建議 ${rec.target}、上限 ${rec.ceiling}),非必要不加價。`, stop: `叫價 ${bid} 已達放棄上限 ${rec.ceiling}。` }[v]);
+      }
+    } else {
+      const mrvRank = evals.filter((r) => r.mrv > rec.mrv).length + 1;
+      const sv = rec.survival;
+      const svText = sv ? `估計撐到 #${sv.targetPick}:${Math.round(sv.estimate * 100)}% (模型估計,依${sv.basis})` : '沒有生存估計 (不知道你的順位)';
+      if (sv && sv.estimate < SURVIVAL.riskyBelow) decision = 'BUY';
+      else if (sv && sv.estimate > SURVIVAL.safeAbove) decision = 'WAIT';
+      else decision = mrvRank <= LIVE.snakeMidTopN ? 'BUY' : 'WAIT';
+      reasons.push(svText, `陣容邊際價值在可選球員中排第 ${mrvRank}`);
+    }
+    const th = p.valid ? analyzeThreat(state, cfg, a.pid) : null;
+    return {
+      pid: a.pid, name: p.name, pos: (p.pos || []).join('/'), auction: Object.assign({}, a, { bids: a.bids.slice() }),
+      decision, reasons, source: S.isAuction ? 'calculated' : 'heuristic', modelVersion: VALUATION_MODEL_VERSION, decisionVersion: DECISION_MODEL_VERSION,
+      mine: rec ? { personalValue: rec.decisionWorth, modelWorth: rec.worth, expectedPrice: rec.fair, recommendedBid: rec.target, maxBid: rec.ceiling,
+        legalMax: ctx.maxBid, mrv: rec.mrv, survival: rec.survival } : null,
+      threats: th ? th.rows.filter((r) => r.level !== 'NONE').slice(0, 3) : [],
+      nextTargets: rankNextTargets(evals.filter((r) => r.pid !== a.pid)),
+    };
+  }
+
+  function rankNextTargets(evals) {
+    const high = evals.filter((r) => r.priority === 'high').sort((x, y) => y.mrv - x.mrv);
+    const rest = evals.filter((r) => r.priority !== 'high').sort((x, y) => y.mrv - x.mrv);
+    return high.concat(rest).slice(0, LIVE.nextTargets);
+  }
+  /** 下一批目標 (現場模式在沒有目前球員時也會用到):高優先在前,其餘依陣容邊際價值;排除「不選」與買不起的球員。 */
+  function nextTargets(state, cfg, excludePid) {
+    const S = state.settings, ctx = buildContext(state, cfg);
+    return rankNextTargets(state.available().filter((x) => x.pid !== excludePid).map((x) => evaluate(state, cfg, ctx, x.pid))
+      .filter((r) => r && !r.doNotDraft && (!S.isAuction || r.fair <= ctx.maxBid + 0.5)));
+  }
+
+  // ================================================================== Draft Simulation (Phase 5,heuristic)
+  // 我方「照模型行動」:拍賣出價上限 = 模型的放棄上限 (rec.ceiling);Snake 選 recommend() 第一名。
+  // 對手 (heuristic):拍賣出價上限 = 預期成交價 × (1 + 常態誤差 oppBidNoise);Snake 依 ADP + 常態誤差選人,
+  //   σ 與 Snake 生存估計相同 (max(3, 0.2 × 預期順位)),沒有 ADP 時用模型排名。
+  // 拍賣:輪流提名「基礎價 × (1 + 誤差)」最高者;成交價 = 第二高出價 + 1 (不超過得標者的上限,不低於最低價);
+  //   沒有人要時由提名者以最低價得標 (提名者放不下則視為流標)。所有隊伍都受合法最高出價與陣容位置限制。
+  const SIMULATION = { oppBidNoise: 0.15, nominationNoise: 0.10, nominationPool: 30, snakeCandidatePool: 40, runChoices: [100, 500, 1000] };
+
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function gaussian(rng) {
+    let u = 0;
+    while (u === 0) u = rng();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
+  }
+
+  /** 這隊能不能放進這名球員:有空位;若剩下的空位都得用來補先發,就必須能補上先發缺口 (與 evaluate 的規則相同)。 */
+  function canRoster(state, teamKey, p) {
+    if (!p || state.openSpots(teamKey) <= 0) return false;
+    const active = activeSlots(state.settings);
+    const posSets = state.roster(teamKey).map((pk) => state.get(pk.pid).posSet);
+    const matched = maxMatch(active, posSets);
+    if (state.openSpots(teamKey) > active.length - matched) return true;
+    return maxMatch(active, posSets.concat([p.posSet])) > matched;
+  }
+
+  /** 依預期被選順位排序的球員 (ADP,沒有則用模型排名);每場模擬共用。 */
+  function simulationOrder(state) {
+    const edp = (p) => (isNum(p.adp) ? p.adp : p.rank);
+    return state.model.players.filter((p) => p.valid).slice().sort((a, b) => edp(a) - edp(b));
+  }
+
+  function cloneForSim(state) {
+    const st = new DraftState(state.settings, state.model, state.teams, state.myKey);
+    st.overrides = state.overrides || {}; st.cfg = state.cfg; st.snapshotsEnabled = false;
+    st.picks = state.picks.map((pk) => Object.assign({}, pk));
+    return st;
+  }
+
+  function simAuctionStep(st, cfg, rng, sim) {
+    const S = st.settings;
+    const nominators = st.teams.filter((t) => st.openSpots(t.key) > 0 && !(sim.excludeMe && t.key === st.myKey));
+    if (!nominators.length) return null;
+    const nom = nominators[sim.nomIdx++ % nominators.length];
+    const pool = st.available().filter((p) => !sim.unsold.has(p.pid)).slice(0, SIMULATION.nominationPool);
+    if (!pool.length) return null;
+    let p = null, bestN = -Infinity;
+    pool.forEach((c) => { const v = c.dollars * (1 + sim.nominationNoise * gaussian(rng)); if (v > bestN) { bestN = v; p = c; } });
+    const price0 = expectedPrice(S, p.dollars, st.inflation());
+    let myCeiling = null;
+    const bids = st.teams.map((t) => {
+      if (!canRoster(st, t.key, p)) return 0;
+      let w;
+      if (t.key === st.myKey) {
+        if (sim.excludeMe) return 0;
+        const r = evaluate(st, cfg, buildContext(st, cfg), p.pid);
+        w = r && !r.doNotDraft ? r.ceiling : 0; myCeiling = w;
+      } else w = price0 * (1 + sim.oppBidNoise * gaussian(rng));
+      return Math.max(0, Math.min(Math.floor(w), st.maxBid(t.key)));
+    });
+    const order = bids.map((b, i) => ({ b, i })).sort((x, y) => y.b - x.b);
+    const top = order[0].b;
+    let winner, price, defaulted = false;
+    if (top >= S.minBid) {
+      const tied = order.filter((x) => x.b === top);
+      winner = tied[Math.floor(rng() * tied.length)].i;
+      const second = tied.length > 1 ? top : (order[1] ? order[1].b : 0);
+      price = Math.max(S.minBid, Math.min(top, second + 1));
+    } else if (canRoster(st, nom.key, p) && st.maxBid(nom.key) >= S.minBid) {
+      winner = st.teams.indexOf(nom); price = S.minBid; defaulted = true;
+    } else { sim.unsold.add(p.pid); return { unsold: p.pid }; }
+    const teamKey = st.teams[winner].key, legalMax = st.maxBid(teamKey);
+    st.addPick(p.pid, teamKey, price, 'sim');
+    return { pid: p.pid, teamKey, price, legalMax, myCeiling, defaulted, nominatedBy: nom.key };
+  }
+
+  function teamAtPick(state, cfg, k) {
+    const order = draftOrder(state, cfg), n = order.length, r = Math.floor(k / n), i = k % n;
+    return order[r % 2 === 0 ? i : n - 1 - i];
+  }
+  function simSnakeStep(st, cfg, rng, sim) {
+    const n = st.teams.length;
+    let team = null;
+    for (let k = st.picksMade(); k < st.picksMade() + 2 * n; k++) { const t = teamAtPick(st, cfg, k); if (t && st.openSpots(t.key) > 0) { team = t; break; } }
+    if (!team) return null;
+    if (team.key === st.myKey && sim.excludeMe) return { myTurn: true };
+    let p = null, expectedMyPick = null;
+    if (team.key === st.myKey) {
+      const r = snakeBestPick(st, cfg);
+      if (sim.checkMyPick) { const full = recommend(st, cfg, 1).recs[0]; expectedMyPick = full ? full.pid : null; }
+      if (!r) return null;
+      p = st.get(r.pid);
+    } else {
+      const drafted = st.draftedIds();
+      const pool = [];
+      for (const c of sim.byEdp) { if (!drafted.has(c.pid)) { pool.push(c); if (pool.length >= SIMULATION.snakeCandidatePool) break; } }
+      let best = Infinity;
+      pool.forEach((c) => {
+        if (!canRoster(st, team.key, c)) return;
+        const edp = isNum(c.adp) ? c.adp : c.rank;
+        const v = edp + Math.max(SURVIVAL.sigmaMin, SURVIVAL.sigmaRatio * edp) * gaussian(rng);
+        if (v < best) { best = v; p = c; }
+      });
+      if (!p) p = st.available().find((c) => canRoster(st, team.key, c)) || null;   // 前段候選都放不下時,依序找第一個放得下的
+      if (!p) return null;
+    }
+    st.addPick(p.pid, team.key, 0, 'sim');
+    return { pid: p.pid, teamKey: team.key, price: 0, expectedMyPick };
+  }
+
+  function simParams(opts) {
+    const p = { oppBidNoise: SIMULATION.oppBidNoise, nominationNoise: SIMULATION.nominationNoise };
+    ['oppBidNoise', 'nominationNoise'].forEach((k) => {
+      if (opts && opts[k] != null) {
+        const v = Number(opts[k]);
+        if (!isNum(v) || v < 0 || v > 1) throw new Error(`${k} 必須介於 0 與 1 之間`);
+        p[k] = v;
+      }
+    });
+    return p;
+  }
+
+  /** 從目前狀態模擬到選秀結束 (一場)。回傳模擬後的狀態複本;不改動傳入的狀態。 */
+  function simulateOnce(base, cfg, rng, opts) {
+    opts = opts || {};
+    const st = cloneForSim(base);
+    const sim = Object.assign({ nomIdx: opts.nomStart || 0, unsold: new Set(), excludeMe: !!opts.excludeMe, byEdp: opts.byEdp || simulationOrder(base), checkMyPick: !!opts.checkMyPick }, simParams(opts));
+    const step = st.settings.isAuction ? simAuctionStep : simSnakeStep;
+    const maxSteps = st.teams.length * rosterSize(st.settings) * 3;
+    for (let i = 0; i < maxSteps; i++) {
+      if (st.teams.every((t) => st.openSpots(t.key) <= 0)) break;
+      const r = step(st, cfg, rng, sim);
+      if (!r || r.myTurn) break;
+      if (r.pid && opts.onPick) opts.onPick(r);
+    }
+    return st;
+  }
+
+  function pctl(sorted, q) {
+    if (!sorted.length) return null;
+    const i = (sorted.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+  }
+  function dist(arr) {
+    const s = arr.slice().sort((a, b) => a - b);
+    return { mean: s.length ? sum(s) / s.length : null, p10: pctl(s, 0.1), p50: pctl(s, 0.5), p90: pctl(s, 0.9) };
+  }
+
+  /**
+   * 可分段執行的 Monte Carlo 模擬 (背景執行與進度顯示用):step(k) 再跑 k 場;done 後用 result() 取得彙總。
+   * 每場從「目前的選秀狀態」開始模擬到結束;模擬開始前已選走的球員不列入取得頻率。
+   */
+  function createSimulation(state, cfg, opts) {
+    opts = opts || {};
+    const runs = clip(Math.round(opts.runs || 100), 1, 5000);
+    const params = simParams(opts);
+    const seed = isNum(opts.seed) ? (opts.seed >>> 0) : (Date.now() % 2147483647);
+    const rng = mulberry32(seed), byEdp = simulationOrder(state);
+    const S = state.settings, cats = state.model.cats, n = state.teams.length, startPicks = state.picks.length;
+    const acc = { spent: [], value: [], valueRank: [], fill: [], pos: POSITIONS.map(() => []), catZ: cats.map(() => []), catRank: cats.map(() => []), players: new Map() };
+    const t0 = Date.now();
+    let completed = 0;
+    function runOne() {
+      const fin = simulateOnce(state, cfg, rng, Object.assign({ byEdp, nomStart: Math.floor(rng() * n) }, params));
+      const teamStats = fin.teams.map((t) => {
+        const ps = fin.roster(t.key).map((pk) => fin.get(pk.pid)).filter((p) => p && p.valid);
+        return { key: t.key, z: cats.map((_c, i) => sum(ps.map((p) => p.zv[i]))), value: sum(ps.map((p) => p.value)) };
+      });
+      const me = teamStats.find((t) => t.key === state.myKey);
+      const myRoster = fin.roster(state.myKey).map((pk) => fin.get(pk.pid));
+      acc.fill.push(myRoster.length);
+      acc.spent.push(fin.spent(state.myKey));
+      acc.value.push(me.value);
+      acc.valueRank.push(1 + teamStats.filter((t) => t.value > me.value).length);
+      POSITIONS.forEach((pos, i) => acc.pos[i].push(myRoster.filter((p) => p && p.posSet && p.posSet.has(pos)).length));
+      cats.forEach((_c, i) => { acc.catZ[i].push(me.z[i]); acc.catRank[i].push(1 + teamStats.filter((t) => t.z[i] > me.z[i]).length); });
+      fin.picks.slice(startPicks).forEach((pk) => {
+        if (!acc.players.has(pk.pid)) acc.players.set(pk.pid, { mine: 0, drafted: 0, priceSum: 0, priceMineSum: 0, pickSum: 0 });
+        const a = acc.players.get(pk.pid);
+        a.drafted++; a.priceSum += pk.price; a.pickSum += pk.pickNo;
+        if (pk.teamKey === state.myKey) { a.mine++; a.priceMineSum += pk.price; }
+      });
+      completed++;
+    }
+    return {
+      total: runs, seed,
+      get completed() { return completed; },
+      get done() { return completed >= runs; },
+      step(k) { for (let i = 0; i < (k || 1) && completed < runs; i++) runOne(); return completed; },
+      result() {
+        const players = [...acc.players.entries()].map(([pid, a]) => {
+          const p = state.get(pid);
+          return { pid, sid: p.sid, name: p.name, pos: (p.pos || []).join('/'), pMine: a.mine / completed, pDrafted: a.drafted / completed,
+            avgPrice: S.isAuction ? a.priceSum / a.drafted : null, avgPriceMine: S.isAuction && a.mine ? a.priceMineSum / a.mine : null,
+            avgPick: S.isAuction ? null : a.pickSum / a.drafted };
+        }).sort((x, y) => (y.pMine - x.pMine) || (y.pDrafted - x.pDrafted));
+        const spent = dist(acc.spent);
+        return {
+          source: 'simulation (heuristic)', runs: completed, seed, startedAtPick: startPicks, elapsedMs: Date.now() - t0,
+          modelVersion: VALUATION_MODEL_VERSION, decisionVersion: DECISION_MODEL_VERSION,
+          configFingerprint: state.model.configFingerprint || null, personalFingerprint: personalFingerprint(cfg),
+          assumptions: Object.assign({}, SIMULATION, params, {
+            myPolicy: S.isAuction ? '我方出價上限 = 模型的放棄上限 (rec.ceiling)' : '我方選 recommend() 第一名',
+            opponentPolicy: S.isAuction ? `對手出價上限 = 預期成交價 × (1 + 常態誤差 σ=${params.oppBidNoise});輪流提名基礎價 × (1 + 誤差 σ=${params.nominationNoise}) 最高者;成交價 = 第二高出價 + 1`
+              : `對手依 ADP (沒有則用模型排名) + 常態誤差選人,σ = max(${SURVIVAL.sigmaMin}, ${SURVIVAL.sigmaRatio} × 順位)`,
+          }),
+          my: {
+            rosterFill: dist(acc.fill),
+            spent: S.isAuction ? spent : null,
+            leftover: S.isAuction ? { mean: S.budget - spent.mean, p10: S.budget - spent.p90, p50: S.budget - spent.p50, p90: S.budget - spent.p10 } : null,
+            totalValue: dist(acc.value),
+            valueRank: Object.assign(dist(acc.valueRank), { rankDist: Array.from({ length: n }, (_x, r) => acc.valueRank.filter((v) => v === r + 1).length) }),
+            positions: POSITIONS.map((pos, i) => ({ pos, mean: dist(acc.pos[i]).mean })),
+            categories: cats.map((c, i) => Object.assign({ label: c.label }, (({ mean, p10, p90 }) => ({ meanZ: mean, p10Z: p10, p90Z: p90 }))(dist(acc.catZ[i])),
+              { meanRank: dist(acc.catRank[i]).mean, rankDist: Array.from({ length: n }, (_x, r) => acc.catRank[i].filter((v) => v === r + 1).length) })),
+          },
+          players,
+        };
+      },
+    };
+  }
+  /**
+   * S4:在「真實狀態」上模擬他隊選 n 手 (Demo 用)。與 Monte Carlo 使用同一套對手行為;我方不參與,
+   * 拍賣時我方不提名也不出價;Snake 依選秀順序,輪到我方就停下。寫入真實狀態,因此照常記錄成交快照。
+   */
+  function simulatePicks(state, cfg, n, opts) {
+    opts = opts || {};
+    const rng = mulberry32(isNum(opts.seed) ? opts.seed : (Date.now() % 2147483647));
+    const sim = Object.assign({ nomIdx: Math.floor(rng() * state.teams.length), unsold: new Set(), excludeMe: true, byEdp: simulationOrder(state) }, simParams(opts));
+    const step = state.settings.isAuction ? simAuctionStep : simSnakeStep;
+    let made = 0, stoppedAtMyTurn = false;
+    for (let guard = 0; made < n && guard < n * 5; guard++) {
+      const r = step(state, cfg, rng, sim);
+      if (!r) break;
+      if (r.myTurn) { stoppedAtMyTurn = true; break; }
+      if (r.pid) made++;
+    }
+    return { made, stoppedAtMyTurn };
+  }
+  function simulateDraft(state, cfg, opts) {
+    const sim = createSimulation(state, cfg, opts);
+    while (!sim.done) sim.step(10);
+    return sim.result();
+  }
+
+  // ------------------------------------------------------------------ Market Calibration (Phase 4,C12:只顯示,不回饋估值)
+  const CALIBRATION = { minSample: 5, priceCuts: [0.025, 0.075, 0.15] };
+
+  /** 把目前選秀中「有快照且有成交價」的紀錄整理成校準資料 (可跨選秀累積保存)。 */
+  function calibrationRecords(state, draftId) {
+    return state.picks.filter((pk) => pk.snap && isNum(pk.price) && pk.price > 0)
+      .map((pk) => ({ draftId, sid: pk.sid || pk.snap.sid, teamKey: pk.teamKey, price: pk.price, snap: pk.snap }));
+  }
+
+  /**
+   * 實際成交 ÷ 模型預期 (observed)。每組以總額計算 (比逐筆比值平均穩健);樣本少於 minSample 時不給數字。
+   * 分組:位置 (第一個列出的位置)、球員層級、預期價格區間、選秀階段、主要強項類別。
+   */
+  function computeCalibration(records, settings, opts) {
+    const minSample = (opts && opts.minSample) || CALIBRATION.minSample;
+    const version = (opts && opts.modelVersion) || VALUATION_MODEL_VERSION;   // '*' = 明確要求混合所有版本;否則依主版本比對
+    if (!settings || !settings.isAuction) return { available: false, reason: 'Snake 沒有成交價,市場校準只適用拍賣。', source: 'observed', minSample, modelVersion: version };
+    const usable = (records || []).filter((r) => r && r.snap && isNum(r.snap.expectedPrice) && r.snap.expectedPrice > 0 && isNum(r.price) && r.price > 0);
+    const excluded = {};
+    const valid = usable.filter((r) => {
+      if (version === '*' || sameMajor(r.snap.modelVersion, version)) return true;
+      const k = r.snap.modelVersion || 'unversioned'; excluded[k] = (excluded[k] || 0) + 1; return false;
+    });
+    const agg = (key, list) => {
+      const n = list.length, actual = sum(list.map((r) => r.price)), expected = sum(list.map((r) => r.snap.expectedPrice));
+      const insufficient = n < minSample;
+      return { key, n, actual, expected, ratio: insufficient ? null : actual / expected, pct: insufficient ? null : actual / expected - 1, insufficient };
+    };
+    const groupBy = (field) => {
+      const m = new Map();
+      valid.forEach((r) => { const k = r.snap[field] || '—'; if (!m.has(k)) m.set(k, []); m.get(k).push(r); });
+      return [...m.entries()].map(([k, list]) => agg(k, list)).sort((a, b) => b.n - a.n);
+    };
+    return {
+      available: true, minSample, source: 'observed', modelVersion: version, comparedMajor: version === '*' ? '*' : majorOf(version), excluded, overall: agg('全部', valid),
+      groups: { position: groupBy('primaryPos'), tier: groupBy('tier'), priceRange: groupBy('priceRange'), stage: groupBy('stage'), category: groupBy('topCat') },
+    };
+  }
+
+  // ------------------------------------------------------------------ Snake 生存估計 (Phase 3,heuristic)
+  // 常態分佈近似球員被選走的順位:平均 = ADP (C11:ADP 只用於時機判斷,不進任何估值);沒有 ADP 時用模型排名代替。
+  // σ 為啟發式設定 (順位越後面市場分歧越大),不是由資料擬合的參數。
+  const SURVIVAL = { sigmaMin: 3, sigmaRatio: 0.20, riskyBelow: 0.40, safeAbove: 0.70 };
+
+  /** 標準常態累積分佈 (Abramowitz & Stegun 7.1.26,誤差 < 1.5e-7)。 */
+  function normalCdf(x) {
+    const t = 1 / (1 + 0.3275911 * Math.abs(x) / Math.SQRT2);
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-(x * x) / 2);
+    return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
+  }
+
+  /** 我方下一個「會用來判斷能不能等」的順位:現在輪到我 → 算到再下一次;否則算到下一次。 */
+  function survivalReference(state, cfg) {
+    if (state.settings.isAuction) return null;
+    const next = nextMyPicks(state, cfg);
+    if (!next) return null;
+    const current = state.picksMade();
+    const onClock = next[0] === current + 1;
+    return { current, onClock, target: onClock ? next[1] : next[0] };
+  }
+
+  /** 估計球員能撐到參考順位的機率 (條件於他目前仍未被選)。heuristic,不是統計驗證的機率。 */
+  function estimateSurvival(state, cfg, pid, ref) {
+    ref = ref === undefined ? survivalReference(state, cfg) : ref;
+    const p = state.get(pid);
+    if (!ref || !p || !p.valid) return null;
+    const basis = isNum(p.adp) ? 'ADP' : (isNum(p.rank) ? '模型排名' : null);
+    if (!basis) return null;
+    const edp = basis === 'ADP' ? p.adp : p.rank;
+    const sigma = Math.max(SURVIVAL.sigmaMin, SURVIVAL.sigmaRatio * edp);
+    const tail = (t) => 1 - normalCdf((t - edp) / sigma);                 // P(被選順位 > t)
+    const denom = tail(ref.current + 0.5), numer = tail(ref.target - 0.5);  // 連續性修正
+    const estimate = denom < 1e-12 ? 0 : clip(numer / denom, 0, 1);
+    const suggestion = estimate < SURVIVAL.riskyBelow ? '等待風險高' : (estimate > SURVIVAL.safeAbove ? '可能等得到' : '不確定');
+    return { estimate, targetPick: ref.target, picksUntil: ref.target - ref.current - 1, onClock: ref.onClock, edp, sigma, basis, suggestion, source: 'heuristic' };
+  }
+
+  // ------------------------------------------------------------------ Position / Category run 偵測 (Phase 3)
+  // 計數是 observed (實際選秀紀錄);判定門檻是 heuristic。只提供客觀資訊,不下「一定要搶」的指令。
+  const RUN = { windowMin: 4, windowMax: 8, minCount: 3, minIntensity: 1.5, strongZ: 1.0 };
+
+  function detectRuns(state, cfg) {
+    const S = state.settings, m = state.model;
+    const W = clip(Math.round(S.numTeams / 2), RUN.windowMin, RUN.windowMax);
+    const picks = state.picks.slice().sort((a, b) => (a.pickNo || 0) - (b.pickNo || 0));
+    const nextPick = S.isAuction ? null : (nextMyPicks(state, cfg) || [null])[0];
+    const base = { window: W, picksMade: picks.length, nextPick, runs: [], positions: [], categories: [], source: 'observed + heuristic' };
+    if (picks.length < W) return Object.assign(base, { insufficient: true, reason: `至少需要 ${W} 手選秀紀錄才能偵測 run (目前 ${picks.length} 手)。` });
+    const recent = picks.slice(-W).map((pk) => state.get(pk.pid)).filter(Boolean);
+    const pool = m.players.filter((p) => p.valid).slice(0, m.nPool);
+    const avail = state.available();
+    const mk = (kind, label, count, n, share, remaining) => {
+      const expected = share * n;
+      const intensity = expected > 0 ? count / expected : (count > 0 ? Infinity : 0);
+      return { kind, label, count, window: n, expected, intensity, remaining, isRun: count >= RUN.minCount && intensity >= RUN.minIntensity };
+    };
+    base.positions = POSITIONS.map((pos) => mk('position', pos,
+      recent.filter((p) => p.posSet && p.posSet.has(pos)).length, recent.length,
+      pool.length ? pool.filter((p) => p.posSet.has(pos)).length / pool.length : 0,
+      avail.filter((p) => p.posSet.has(pos) && p.value >= m.starterLine).length));
+    const withZ = recent.filter((p) => p.zv);
+    base.categories = m.cats.map((c, i) => mk('category', c.label,
+      withZ.filter((p) => p.zv[i] >= RUN.strongZ).length, withZ.length,
+      pool.length ? pool.filter((p) => p.zv[i] >= RUN.strongZ).length / pool.length : 0,
+      avail.filter((p) => p.zv[i] >= RUN.strongZ && p.value >= m.starterLine).length));
+    base.runs = base.positions.concat(base.categories).filter((x) => x.isRun).sort((a, b) => b.intensity - a.intensity);
+    return base;
+  }
+
+  // ------------------------------------------------------------------ Projection uncertainty (Phase 3)
+  /**
+   * 用「目前模型的同一套尺度」(各類別平均、標準差、聯盟命中率) 替任一數據列計分,回傳 z 向量總和。
+   * 缺少任何需要的欄位就回傳 null (不補值、不猜)。比率類別若只有命中率沒有命中數,以 命中率 × 出手數 換算。
+   */
+  function scoreStatLine(model, line) {
+    if (!line) return null;
+    let total = 0;
+    for (let i = 0; i < model.cats.length; i++) {
+      const c = model.cats[i], spec = RATIO_SPECS[c.key], cs = model.catStats[i];
+      const row = Object.assign({}, line);
+      if (spec) {
+        const [made, att] = spec, pctCol = PCT_COL[made];
+        if (!isNum(row[made]) && isNum(row[pctCol]) && isNum(row[att])) row[made] = row[pctCol] * row[att];
+        if (!isNum(row[made]) || !isNum(row[att])) return null;
+      } else if (!isNum(row[c.key])) return null;
+      total += (cs.higherBetter ? 1 : -1) * ((catRaw(c, row, model.baselines) - cs.mu) / cs.sd);
+    }
+    return total;
+  }
+
+  /**
+   * 季與季之間的實際高低範圍 (estimated,不是統計信賴區間)。
+   * 對每位球員,把每個「出賽數 ≥ minGp 且欄位完整」的球季數據,放進同一估值尺度計分,
+   * 再套用該球員目前的出勤係數與稀缺加成換成美元。取最低 / 中位 / 最高 = 保守 / 中位 / 樂觀。
+   * 少於 2 季可用時標示資料不足,不產生範圍。
+   */
+  function attachProjectionRange(model, seasons, cfg) {
+    const minGp = (cfg && cfg.minGp) || 15;
+    const index = (seasons || []).map((s) => ({ label: s.label, byName: new Map((s.players || []).map((p) => [normName(p.name), p])) }));
+    model.players.forEach((p) => {
+      if (!p.valid) { p.projectionRange = null; return; }
+      const pts = [];
+      index.forEach((s) => {
+        const row = s.byName.get(normName(p.name));
+        if (!row || !(isNum(row.gp) && row.gp >= minGp)) return;
+        const sc = scoreStatLine(model, row);
+        if (sc != null) pts.push({ label: s.label, score: sc });
+      });
+      if (pts.length < 2) {
+        p.projectionRange = { n: pts.length, insufficient: true, source: 'estimated', reason: pts.length ? '只有 1 季可用的數據,無法估計季間範圍。' : '沒有可用的球季數據。' };
+        return;
+      }
+      const sorted = pts.map((x) => x.score).sort((a, b) => a - b);
+      const mid = sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+      const toTier = (score) => ({ score, dollars: model.toDollars(HM.applyAvailability(score, p.availMult) + p.scarcityBonus) });
+      p.projectionRange = {
+        n: pts.length, insufficient: false, source: 'estimated', method: 'season-dispersion',
+        low: toTier(sorted[0]), median: toTier(mid), high: toTier(sorted[sorted.length - 1]), seasons: pts,
+      };
+    });
+  }
+
+  // ------------------------------------------------------------------ 估值管線服務 (唯一入口)
+  /** 跨季比較用的「另一季」:混合模式固定比最新一季;單季模式比「不是目前這季」裡最新的一季。只依上傳順序,不綁年份字串。 */
+  function comparisonSeasonIndex(seasons, primaryIdx) {
+    if (!seasons || seasons.length < 2) return -1;
+    if (primaryIdx === 'blend') return 0;
+    return seasons.findIndex((_s, i) => i !== primaryIdx);
+  }
+
+  /**
+   * 原始資料 → 歷史 (選填混合) → 出勤 → 估值 (稀缺、替補線) → 比較 / 新秀附加。UI 只呼叫這個函式。
+   * seasons: [{label, players}] 由新到舊;primaryIdx: 數字索引或 'blend'。
+   * 出勤一律用「所有已上傳球季」的 GP 歷史 (規格 §7:出勤是對下一季的預估,與估值用哪一季的數據無關)。
+   */
+  function buildValuationPipeline(opts) {
+    const { seasons, primaryIdx, settings, cfg, rookies, manualGpAdjustments, overrides } = opts;
+    if (!seasons || !seasons.length) throw new Error('沒有任何球員資料。');
+    const blend = primaryIdx === 'blend';
+    const idx = blend ? 0 : clip(Number(primaryIdx) || 0, 0, seasons.length - 1);
+    const raw = blend ? HM.blendSeasonsForModel(seasons, normName) : seasons[idx].players.map((p) => Object.assign({}, p));
+    const gpMap = Object.assign({}, manualGpAdjustments || {});
+    if (overrides && Object.keys(overrides).length) {
+      assignStableIds(raw);
+      raw.forEach((p) => {
+        const o = overrides[p.sid] || overrides[p.nameKey];
+        if (o && isNum(o.gpAdjustment) && o.gpAdjustment !== 0) gpMap[normName(p.name)] = o.gpAdjustment;
+      });
+    }
+    HM.attachHistoricalAvailability(raw, seasons, normName, gpMap);
+    const model = buildModel(raw, settings, cfg);
+    const cmpIdx = comparisonSeasonIndex(seasons, blend ? 'blend' : idx);
+    if (cmpIdx >= 0) {
+      const cmp = seasons[cmpIdx];
+      attachComparison(model, cmp.label, new Map(cmp.players.map((p) => [normName(p.name), p])));
+    }
+    attachProjectionRange(model, seasons, cfg);
+    attachRookiePool(model, rookies || []);
+    model.configFingerprint = globalFingerprint(settings, cfg, seasons, primaryIdx, overrides);
+    return model;
+  }
+
+  /**
+   * Snake 最佳人選 = recommend() 的第一名 (相同的篩選與排序:排除 null 與「不選」、依 decisionScore、同分時依可選名單順序)。
+   * Snake 的推薦排序不使用 MRV,因此以 lite 模式計算,結果完全相同;由測試逐一比對保證。
+   */
+  function snakeBestPick(state, cfg, ctx) {
+    ctx = ctx || buildContext(state, cfg);
+    if (ctx.spots <= 0) return null;   // 與 recommend() 相同:陣容已滿就不推薦
+    let best = null;
+    for (const p of state.available()) {
+      const r = evaluate(state, cfg, ctx, p.pid, { lite: true });
+      if (r && !r.doNotDraft && (!best || r.decisionScore > best.decisionScore)) best = r;
+    }
+    return best;
   }
 
   /** 對「場上叫價」給結論:cheap / fair / premium / stop */
@@ -922,6 +2409,8 @@ window.ROOKIE_POOL = [
     adp: ['adp', 'avg pick', 'average pick'],
   };
   const COUNT_KEYS = ['min', 'fgm', 'fga', 'ftm', 'fta', 'tpm', 'tpa', 'pts', 'oreb', 'dreb', 'reb', 'ast', 'stl', 'blk', 'tov', 'pf', 'dd', 'td'];
+  // 規格 §4.3:League Average / Team Totals 等非球員列,匯入時要整列濾掉,不能被當成球員估值。
+  const NON_PLAYER_NAME_RE = /^(league average|team totals?|western conference|eastern conference|total|totals)$/i;
 
   function parseCSV(text) {
     text = String(text).replace(/^\uFEFF/, '');
@@ -953,6 +2442,7 @@ window.ROOKIE_POOL = [
     rows.slice(1).forEach((r, idx) => {
       const name = (r[col.name] || '').replace(/\*$/, '').trim();
       if (!name || name.toLowerCase() === 'player') { skipped++; return; } // 空列 / 表格中途重複出現的表頭
+      if (NON_PLAYER_NAME_RE.test(name)) { skipped++; return; } // League Average 等非球員列
       const p = { pid: `csv:${idx + 1}`, name, team: col.team !== undefined ? (r[col.team] || '').trim() : '', pos: col.pos !== undefined ? parsePos(r[col.pos]) : [], status: '', adp: null };
       for (const k of ['gp', ...COUNT_KEYS, 'fg_pct', 'ft_pct', 'adp']) p[k] = col[k] !== undefined ? toNum(r[col[k]] || '') : null;
       for (const k of ['fg_pct', 'ft_pct']) if (p[k] !== null && p[k] > 1) p[k] /= 100;
@@ -992,7 +2482,7 @@ window.ROOKIE_POOL = [
     return Array.from({ length: n }, (_, i) => ({ key: `t${i + 1}`, name: (names && names[i]) || `隊伍 ${i + 1}`, isMe: i + 1 === myIdx, draftPosition: i + 1 }));
   }
   function defaultCfg() {
-    return { strategy: 'balanced', puntCats: [], catWeights: {}, needBeta: 0.5, gpWeight: 0.3, gpRef: 70, minGp: 15, nRecs: 5, pollSeconds: 10, myDraftSlot: null, autoSync: true };
+    return { strategy: 'balanced', puntCats: [], catWeights: {}, needBeta: 0.5, availStrength: 1, benchWeight: 0, scarcityWeight: 0.20, gpRef: 70, minGp: 15, nRecs: 5, pollSeconds: 10, myDraftSlot: null, autoSync: true };
   }
 
   return {
@@ -1000,6 +2490,14 @@ window.ROOKIE_POOL = [
     expandPositions, maxMatch, matchDetail, buildModel, DraftState, buildContext, evaluate, recommend, bidVerdict, nextMyPicks,
     strategyReport, parseCSV, playersFromCSV, defaultSettings, defaultTeams, defaultCfg,
     attachComparison, attachRookiePool, recommendRookies, rookiePoolRows,
+    FIELD_SEMANTICS, marginalRosterValue, buildValuationPipeline, comparisonSeasonIndex,
+    categoryNeed, expectedPrice, buildOpponentModel, threatFor, analyzeThreat, nominationAdvice, recommendTracks,
+    scoreStatLine, attachProjectionRange, normalCdf, survivalReference, estimateSurvival, SURVIVAL, detectRuns, RUN,
+    sourceKeyOf, nameKeyOf, assignStableIds, overrideFor, calibrationRecords, computeCalibration, CALIBRATION,
+    draftOrder, teamOnClock, liveDecision, nextTargets, LIVE,
+    VALUATION_MODEL_VERSION, DECISION_MODEL_VERSION, sameMajor, globalFingerprint, personalFingerprint, snakeBestPick,
+    SIMULATION, mulberry32, canRoster, simulationOrder, simulateOnce, createSimulation, simulateDraft, simulatePicks,
+    THREAT_WEIGHTS, THREAT_LEVELS, NOMINATION,
   };
 });
 
@@ -1009,6 +2507,7 @@ window.ROOKIE_POOL = [
 (function () {
   'use strict';
   const E = window.Engine;
+  const HM = window.HistoricalModel;
   const LS_KEY = 'fantasyDraftAssistant.v1';
   const CSV_TEMPLATE = 'Player,Team,Pos,GP,MPG,PTS,REB,AST,STL,BLK,TOV,FGM,FGA,FTM,FTA,3PM,3PA\nExample Player,XXX,"PG,SG",72,32.5,22.4,4.1,6.3,1.2,0.4,2.8,8.1,17.5,4.4,5.2,2.5,6.8\n';
 
@@ -1022,45 +2521,78 @@ window.ROOKIE_POOL = [
     settings: null, teams: [], myKey: null, playersRaw: [], seasons: [], primaryIdx: 0, cfg: E.defaultCfg(), model: null, state: null, ctx: null,
     source: null, bridgeBase: null, bridgeOk: false, syncTimer: null, sync: null, modal: null, setupTab: 'demo',
     ui: { tab: 'players', q: '', pos: 'ALL', affordable: false, showDrafted: false, sort: { key: 'value', dir: -1 }, limit: 100,
-      rq: '', rpos: 'ALL', rsort: { key: 'pick', dir: 1 }, showCmp: false },
+      rq: '', rpos: 'ALL', rsort: { key: 'pick', dir: 1 }, showCmp: false, recTab: 'mix', live: false, liveQ: '' },
   };
+
+  // ------------------------------------------------------------------ 市場校準歷史 (跨選秀保存;只顯示,不回饋估值)
+  const CAL_KEY = 'fantasyDraftAssistant.calibration.v1';
+  function loadCalHistory() { try { return JSON.parse(localStorage.getItem(CAL_KEY)) || { drafts: {} }; } catch (e) { return { drafts: {} }; } }
+  function saveCalHistory(h) { try { localStorage.setItem(CAL_KEY, JSON.stringify(h)); } catch (e) { toast('瀏覽器空間不足,校準歷史未能儲存。', true); } }
+  /** 以 draftId 為鍵存入 (重複存入會覆蓋同一次選秀,不會重複計算)。 */
+  function archiveCalibration(silent) {
+    const recs = E.calibrationRecords(A.state, A.draftId);
+    if (!recs.length) { if (!silent) toast('目前沒有可存入的成交紀錄。', true); return false; }
+    const h = loadCalHistory();
+    h.drafts[A.draftId] = { savedAt: new Date().toISOString(), league: A.settings.name, records: recs };
+    saveCalHistory(h);
+    if (!silent) toast(`已存入本次選秀的 ${recs.length} 筆成交紀錄。`);
+    return true;
+  }
+  function draftComplete() { return A.state && A.teams.every((t) => A.state.openSpots(t.key) === 0); }
 
   // ------------------------------------------------------------------ 存檔
   function save() {
     if (!A.state) return;
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({ v: 2, source: A.source, settings: A.settings, teams: A.teams, myKey: A.myKey, seasons: A.seasons, primaryIdx: A.primaryIdx, cfg: A.cfg, picks: A.state.picks, bridgeBase: A.bridgeBase }));
+      localStorage.setItem(LS_KEY, JSON.stringify({ v: 2, source: A.source, settings: A.settings, teams: A.teams, myKey: A.myKey, seasons: A.seasons, primaryIdx: A.primaryIdx, cfg: A.cfg, picks: A.state.picks, bridgeBase: A.bridgeBase,
+        overrides: A.overrides, draftId: A.draftId, currentAuction: A.state.currentAuction,
+        modelVersion: E.VALUATION_MODEL_VERSION, decisionVersion: E.DECISION_MODEL_VERSION }));
     } catch (e) { toast('瀏覽器空間不足,進度未能自動儲存。可到「設定」匯出進度備份。', true); }
+    if (A.settings.isAuction && draftComplete() && archiveCalibration(true) && !A.calAutoToast) {
+      A.calAutoToast = true; toast('選秀已完成,成交紀錄已自動存入市場校準歷史。');
+    }
   }
   function load() {
     try { const raw = localStorage.getItem(LS_KEY); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
   }
 
   // ------------------------------------------------------------------ 初始化
-  function recompute(picks) {
+  function isBlendMode() { return A.primaryIdx === 'blend'; }
+  function primaryLabel() { return isBlendMode() ? `${A.seasons.length} 季歷史混合` : (A.seasons[A.primaryIdx] ? A.seasons[A.primaryIdx].label : ''); }
+  function recompute(picks, auction) {
     const prev = picks || (A.state ? A.state.picks : []);
-    A.playersRaw = A.seasons[A.primaryIdx].players;
-    const model = E.buildModel(A.playersRaw, A.settings, A.cfg);
-    if (A.seasons.length === 2) {
-      const cmp = A.seasons[1 - A.primaryIdx];
-      E.attachComparison(model, cmp.label, new Map(cmp.players.map((p) => [E.normName(p.name), p])));
-    }
-    E.attachRookiePool(model, window.ROOKIE_POOL || []);
+    const prevAuction = auction !== undefined ? auction : (A.state ? A.state.currentAuction : null);
+    const model = E.buildValuationPipeline({
+      seasons: A.seasons, primaryIdx: A.primaryIdx, settings: A.settings, cfg: A.cfg,
+      rookies: window.ROOKIE_POOL || [], overrides: A.overrides || {},
+    });
     const st = new E.DraftState(A.settings, model, A.teams, A.myKey);
-    prev.forEach((p) => { st.ensurePlayer(p.pid); st.picks.push(Object.assign({}, p)); });
+    st.overrides = A.overrides || {};
+    st.cfg = A.cfg;
+    const res = st.restorePicks(prev);   // 依穩定身分還原:重新匯入 CSV 時不會接錯人
+    if (res.rebound) toast(`已依球員身分重新對應 ${res.rebound} 筆選秀紀錄。`);
+    if (prevAuction) {                   // 進行中的拍賣:依 sid 接回;球員已被選走或找不到就放棄
+      const p = (prevAuction.sid && st.getBySid(prevAuction.sid)) || st.get(prevAuction.pid);
+      if (p && !st.draftedIds().has(p.pid)) st.currentAuction = Object.assign({}, prevAuction, { pid: p.pid, sid: p.sid, bids: (prevAuction.bids || []).slice() });
+    }
     A.model = model; A.state = st;
   }
   function init(d) {
     A.settings = d.settings; A.teams = d.teams; A.myKey = d.myKey;
     A.seasons = d.seasons || [{ label: d.seasonLabel || '本季', players: d.players }];
-    A.primaryIdx = Math.min(d.primaryIdx || 0, A.seasons.length - 1);
+    A.primaryIdx = d.primaryIdx === 'blend' ? 'blend' : Math.min(d.primaryIdx || 0, A.seasons.length - 1);
     A.cfg = Object.assign(E.defaultCfg(), d.cfg || {}); A.source = d.source; if (d.bridgeBase) A.bridgeBase = d.bridgeBase;
     if (A.cfg.puntCats && A.cfg.puntCats.length) {                     // 相容舊版存檔:Punt 類別視為權重 0
       A.cfg.catWeights = Object.assign({}, A.cfg.catWeights);
       A.cfg.puntCats.forEach((label) => { if (A.cfg.catWeights[label] == null) A.cfg.catWeights[label] = 0; });
     }
+    A.overrides = d.overrides || {};
+    A.draftId = d.draftId || ('draft-' + Date.now().toString(36));
     A.state = null; A.ui.q = ''; A.ui.pos = 'ALL';
-    recompute(d.picks || []);
+    recompute(d.picks || [], d.currentAuction || null);
+    const unversioned = (d.picks || []).filter((pk) => pk.snap && !pk.snap.modelVersion).length;
+    if (d.modelVersion && !E.sameMajor(d.modelVersion, E.VALUATION_MODEL_VERSION)) toast(`這份進度建立於估值模型 v${d.modelVersion},目前為 v${E.VALUATION_MODEL_VERSION}。既有成交快照保留原本的版本標記,市場校準只比對同一版本。`, true);
+    else if (unversioned) toast(`有 ${unversioned} 筆舊的成交快照沒有模型版本標記,不會列入市場校準。`, true);
     save(); renderAll(); syncTimerReset();
     if (A.source === 'bridge' && A.bridgeBase) syncNow(true);
   }
@@ -1099,7 +2631,8 @@ window.ROOKIE_POOL = [
       A.sync = { ok: true, at: new Date() };
       if (ch.length) {
         save(); renderAll();
-        ch.slice(0, 4).forEach((c) => toast(`${{ new: '新選秀', updated: '更新', removed: '撤銷' }[c.kind]} #${c.pick.pickNo} ${A.state.get(c.pick.pid).name} → ${A.state.teamName(c.pick.teamKey)}${A.settings.isAuction ? ' ' + money(c.pick.price) : ''}`));
+        ch.filter((c) => c.kind === 'auctionClosed').forEach((c) => toast(`進行中的拍賣已結束:${A.state.get(c.pick.pid).name} 已被 ${A.state.teamName(c.pick.teamKey)} 選走 (同步)`, true));
+        ch.filter((c) => c.kind !== 'auctionClosed').slice(0, 4).forEach((c) => toast(`${{ new: '新選秀', updated: '更新', removed: '撤銷' }[c.kind]} #${c.pick.pickNo} ${A.state.get(c.pick.pid).name} → ${A.state.teamName(c.pick.teamKey)}${A.settings.isAuction ? ' ' + money(c.pick.price) : ''}`));
         if (ch.length > 4) toast(`另有 ${ch.length - 4} 筆變動`);
       } else { renderBoard(); if (!quiet) toast('已是最新,沒有新選秀。'); }
     } catch (e) { A.sync = { ok: false, msg: e.message }; renderBoard(); if (!quiet) toast('同步失敗:' + e.message, true); }
@@ -1163,28 +2696,243 @@ window.ROOKIE_POOL = [
       <div class="board-top">
         <div><div class="board-title">${esc(S.name)}</div>
           <div class="board-chips"><span class="chip">${S.numTeams} 隊</span><span class="chip">${S.isAuction ? '拍賣選秀' : 'Snake 選秀'}</span><span class="chip">${S.categories.length}-cat</span>${A.source === 'demo' ? '<span class="chip">Demo 虛構球員</span>' : ''}</div></div>
-        <div class="board-actions">${bridgeBtns}<button class="btn" data-act="undo">撤銷上一手</button><button class="btn" data-act="open-settings">設定</button><button class="btn" data-act="open-setup">更換資料</button></div>
+        <div class="board-actions">${bridgeBtns}<button class="btn ${A.ui.live ? 'on' : ''}" data-act="toggle-live" aria-pressed="${!!A.ui.live}">現場模式</button><button class="btn" data-act="undo">撤銷上一手</button><button class="btn" data-act="open-settings">設定</button><button class="btn" data-act="open-setup">更換資料</button></div>
       </div>
       <div class="leds">${leds.map((l) => `<div class="led"><span class="led-num ${l[2] ? 'warn' : ''}">${esc(l[0])}</span><span class="led-label">${l[1]}</span></div>`).join('')}</div>
     </div>`;
   }
 
   // ------------------------------------------------------------------ 畫面:推薦
+  // 推薦卡片:所有分頁共用同一個樣板,數字全部來自引擎 (UI 不做任何計算)
+  function ovTags(ov) {
+    if (!ov) return '';
+    return (ov.priority === 'high' ? '<span class="tag gold">★</span>' : '') + (ov.doNotDraft ? '<span class="tag inj">不選</span>' : '')
+      + (ov.valueAdjustment || ov.gpAdjustment || ov.targetPrice != null ? '<span class="tag">調整</span>' : '');
+  }
+  function recCard(r, S, extraLine) {
+    return `<article class="rec">
+        <div class="rec-h"><span class="rec-name">${r.priority === 'high' ? '★ ' : ''}${esc(r.name)}</span><span class="ps">${esc(r.pos)}</span>${r.tag ? `<span class="tag ${r.tag === '高CP值' || r.tag === '價值撿漏' ? 'gold' : ''}">${esc(r.tag)}</span>` : ''}${r.status && r.status !== 'NA' ? `<span class="tag inj">${esc(r.status)}</span>` : ''}</div>
+        ${S.isAuction ? `<div class="rec-price"><span>建議出價 <b>${money(r.target)}</b></span><span>上限 <b class="ceil">${money(r.ceiling)}</b></span><small>預期成交 ${money(r.fair)}</small></div>`
+          : `<div class="rec-price"><small>${r.adp ? 'ADP ' + r.adp.toFixed(1) : '無 ADP'}</small></div>`}
+        ${extraLine || ''}
+        <p class="rec-why">${esc(r.reasons.join(';'))}</p>
+        <div class="rec-act"><button class="btn sm" data-act="open-player" data-pid="${esc(r.pid)}">查看</button><button class="btn sm primary" data-act="rec-me" data-pid="${esc(r.pid)}" data-price="${r.target == null ? 0 : r.target}">我選了</button>${A.ui.live ? `<button class="btn sm" data-act="live-set" data-pid="${esc(r.pid)}">設為目前</button>` : ''}</div>
+      </article>`;
+  }
+  const REC_TABS = [
+    { key: 'mix', label: '綜合' }, { key: 'bestPlayer', label: '最佳球員' }, { key: 'bestValue', label: '最佳CP' },
+    { key: 'bestFit', label: '陣容補強' }, { key: 'nomination', label: '提名', auctionOnly: true },
+  ];
+  const TRACK_HINT = {
+    bestPlayer: '全域價值最高、目前陣容放得下且買得起的球員。',
+    bestValue: '「對我的價值 − 預期成交價」差距最大 (Snake:ADP 晚於模型排名最多)。',
+    bestFit: '加入後我方陣容價值增加最多 (已考慮位置重疊)。',
+  };
+  function fmtMetric(m) { return `${m.label} <b>${m.value >= 0 ? '+' : ''}${m.value.toFixed(1)}</b>`; }
+  function nominationHTML(adv) {
+    if (!adv.available) return `<p class="empty">${esc(adv.reason)}</p>`;
+    const sec = (title, hint, items) => `<div class="sec"><h3 style="font-size:14px;margin:6px 0 2px">${title}</h3><p class="hint">${hint}</p>${items.length ? items.map((x) => `<article class="rec">
+        <div class="rec-h"><span class="rec-name">${esc(x.name)}</span><span class="ps">${esc(x.pos)}</span></div>
+        <div class="rec-price"><small>預期成交 ${money(x.expectedPrice)}</small><small>對我價值 ${money(x.worth)}</small></div>
+        <p class="rec-why">${esc(x.reasons.join(';'))}</p>
+        <div class="rec-act"><button class="btn sm" data-act="open-player" data-pid="${esc(x.pid)}">查看</button></div></article>`).join('') : '<p class="hint">目前沒有符合條件的球員。</p>'}</div>`;
+    return `<p class="hint">模型估計 (heuristic):依預期成交價、對我價值、以及「有能力且有需求」的對手數量計算,僅供參考。</p>
+      ${sec('建議提名 (自己要)', '對我的價值 ≥ 預期成交價,且我買得起。', adv.target)}
+      ${sec('消耗對手預算', '高價、對我價值偏低,且至少 2 隊有能力又有需求 —— 提名讓對手互相競價。', adv.burn)}
+      ${sec('避免自己出手', '球員本身不差,但以你目前的陣容 / 預算,預期成交價明顯高於對你的價值。', adv.avoid)}`;
+  }
   function renderRecs() {
     const el = $('#recs'), st = A.state, S = A.settings;
     if (!st) { el.innerHTML = ''; return; }
     const { recs, ctx } = E.recommend(st, A.cfg);
     A.ctx = ctx;
+    const tabs = REC_TABS.filter((t) => !t.auctionOnly || S.isAuction);
+    if (!tabs.some((t) => t.key === A.ui.recTab)) A.ui.recTab = 'mix';
+    const tab = A.ui.recTab;
     const needCats = ctx.cats.filter((c, i) => ctx.need[i] > 0.25).map((c) => c.label);
     const info = ctx.spots <= 0 ? '你的陣容已滿。' : `尚缺 ${ctx.unfilled} 個先發位置${needCats.length ? `;需補強:${needCats.join(' ')}` : ''}`;
-    const cards = recs.map((r, i) => `<article class="rec">
-        <div class="rec-h"><span class="rec-name">${esc(r.name)}</span><span class="ps">${esc(r.pos)}</span>${r.tag ? `<span class="tag ${r.tag === '高CP值' || r.tag === '價值撿漏' ? 'gold' : ''}">${esc(r.tag)}</span>` : ''}${r.status && r.status !== 'NA' ? `<span class="tag inj">${esc(r.status)}</span>` : ''}</div>
-        ${S.isAuction ? `<div class="rec-price"><span>建議出價 <b>${money(r.target)}</b></span><span>上限 <b class="ceil">${money(r.ceiling)}</b></span><small>預期成交 ${money(r.fair)}</small></div>`
-          : `<div class="rec-price"><small>${r.adp ? 'ADP ' + r.adp.toFixed(1) : '無 ADP'}</small></div>`}
-        <p class="rec-why">${esc(r.reasons.join(';'))}</p>
-        <div class="rec-act"><button class="btn sm" data-act="open-player" data-pid="${esc(r.pid)}">查看</button><button class="btn sm primary" data-act="rec-me" data-pid="${esc(r.pid)}" data-price="${r.target == null ? 0 : r.target}">我選了</button></div>
-      </article>`).join('');
-    el.innerHTML = `<div class="panel-h"><h2>推薦球員</h2><span class="hint">依你目前的陣容即時更新</span></div><div class="panel-b"><p class="need">${esc(info)}</p>${cards || '<p class="empty">目前沒有符合條件的球員 (預算不足或名額限制)。</p>'}</div>`;
+    let body;
+    if (tab === 'mix') {
+      body = recs.map((r) => recCard(r, S)).join('') || '<p class="empty">目前沒有符合條件的球員 (預算不足或名額限制)。</p>';
+    } else if (tab === 'nomination') {
+      body = nominationHTML(E.nominationAdvice(st, A.cfg, 3));
+    } else {
+      const tr = E.recommendTracks(st, A.cfg);   // 只有切到這些分頁時才計算
+      const items = tr[tab] || [];
+      const note = tr.notes[tab] || tr.notes.all;
+      body = `<p class="hint">${esc(TRACK_HINT[tab] || '')}</p>` + (items.map((r) => recCard(r, S, `<p class="rec-why">${fmtMetric(r.metric)}</p>`)).join('')
+        || `<p class="empty">${esc(note || '目前沒有符合條件的球員。')}</p>`);
+    }
+    const runs = E.detectRuns(st, A.cfg);
+    const runHTML = runs.runs && runs.runs.length ? `<div class="need" style="border-left:3px solid var(--gold);padding:4px 8px;margin-bottom:8px"><b>盤面動態</b> <span class="hint">最近 ${runs.window} 手 (實際紀錄;判定門檻為 heuristic)</span>${runs.runs.filter((r) => r.kind === 'position').concat(runs.runs.filter((r) => r.kind === 'category').slice(0, 2)).map((r) => `<div>${r.kind === 'position' ? `${esc(r.label)} run` : `${esc(r.label)} 強項 run`}:${r.count}/${r.window} 手 (預期 ${r.expected.toFixed(1)},${r.intensity === Infinity ? '—' : r.intensity.toFixed(1) + '×'});剩餘先發級 ${r.remaining} 名</div>`).join('')}${runs.nextPick ? `<div class="hint">你的下次順位 #${runs.nextPick}</div>` : ''}</div>` : '';
+    const tabBar = `<div class="row" style="gap:4px;padding:0 0 8px">${tabs.map((t) => `<button class="chip ${t.key === tab ? 'on' : ''}" data-act="rec-tab" data-tab="${t.key}" aria-pressed="${t.key === tab}">${t.label}</button>`).join('')}</div>`;
+    el.innerHTML = `<div class="panel-h"><h2>推薦球員</h2><span class="hint">依你目前的陣容即時更新</span></div><div class="panel-b">${tabBar}${runHTML}<p class="need">${esc(info)}</p>${body}</div>`;
+  }
+
+  // ------------------------------------------------------------------ 選秀模擬 (Phase 5):執行控制
+  const WORKER_MAIN = `
+self.onmessage = function (ev) {
+  var d = ev.data, E = self.Engine;
+  try {
+    var model = E.buildValuationPipeline({ seasons: d.seasons, primaryIdx: d.primaryIdx, settings: d.settings, cfg: d.cfg, rookies: d.rookies, overrides: d.overrides });
+    var st = new E.DraftState(d.settings, model, d.teams, d.myKey);
+    st.overrides = d.overrides || {}; st.cfg = d.cfg; st.restorePicks(d.picks);
+    var sim = E.createSimulation(st, d.cfg, { runs: d.runs, seed: d.seed, oppBidNoise: d.oppBidNoise });
+    var chunk = Math.max(1, Math.round(d.runs / 50));
+    while (!sim.done) { sim.step(chunk); self.postMessage({ type: 'progress', completed: sim.completed, total: sim.total }); }
+    self.postMessage({ type: 'done', result: sim.result() });
+  } catch (e) { self.postMessage({ type: 'error', message: String((e && e.message) || e) }); }
+};`;
+  function makeSimWorker() {
+    if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || !window.URL || !URL.createObjectURL) return null;
+    const hm = $('#src-hm'), en = $('#src-engine');
+    if (!hm || !en) return null;
+    try {
+      const url = URL.createObjectURL(new Blob([hm.textContent, '\n', en.textContent, '\n', WORKER_MAIN], { type: 'text/javascript' }));
+      const w = new Worker(url);
+      w._url = url;
+      return w;
+    } catch (e) { return null; }
+  }
+  function simProgress(completed, total) {
+    const el = $('#sim-progress'); if (!el || !A.sim) return;
+    const elapsed = (Date.now() - A.sim.startedAt) / 1000;
+    const eta = completed ? Math.max(0, Math.round(elapsed / completed * (total - completed))) : null;
+    el.textContent = `進行中 ${completed} / ${total} 場${eta != null ? `,約剩 ${eta} 秒` : ''} (${A.sim.mode === 'worker' ? '背景執行,可繼續操作' : '分段執行'})`;
+  }
+  function finishSimulation(result) {
+    if (A.sim && A.sim.worker) { A.sim.worker.terminate(); URL.revokeObjectURL(A.sim.worker._url); }
+    A.simResult = Object.assign(result, { ranWithPicks: A.sim ? A.sim.picks : null, mode: A.sim ? A.sim.mode : null });
+    A.sim = null;
+    if (A.ui.tab === 'strategy') renderPane();
+    toast(`模擬完成:${result.runs} 場。`);
+  }
+  function cancelSimulation() {
+    if (!A.sim) return;
+    if (A.sim.worker) { A.sim.worker.terminate(); URL.revokeObjectURL(A.sim.worker._url); }
+    A.sim.cancelled = true; A.sim = null;
+    if (A.ui.tab === 'strategy') renderPane();
+    toast('已取消模擬。');
+  }
+  function startSimulation() {
+    if (A.sim || !A.state) return;
+    const runs = Number(($('#sim-runs') || {}).value) || 100;
+    const seedIn = ($('#sim-seed') || {}).value;
+    const seed = seedIn !== undefined && seedIn !== '' && Number.isFinite(Number(seedIn)) ? Number(seedIn) >>> 0 : (Date.now() % 2147483647);
+    A.ui.simRuns = runs;
+    const noiseEl = $('#sim-noise'); const oppBidNoise = noiseEl ? Number(noiseEl.value) : E.SIMULATION.oppBidNoise; A.ui.simNoise = oppBidNoise;
+    A.sim = { startedAt: Date.now(), runs, seed, oppBidNoise, picks: A.state.picks.length, mode: 'main' };
+    const worker = makeSimWorker();
+    if (worker) {
+      A.sim.mode = 'worker'; A.sim.worker = worker;
+      worker.onmessage = (ev) => {
+        const m = ev.data;
+        if (m.type === 'progress') simProgress(m.completed, m.total);
+        else if (m.type === 'done') finishSimulation(m.result);
+        else if (m.type === 'error') { toast('模擬失敗:' + m.message, true); cancelSimulation(); }
+      };
+      worker.onerror = () => { toast('背景執行失敗,改在主執行緒執行。', true); worker.terminate(); A.sim = null; runOnMainThread(runs, seed, false, oppBidNoise); };
+      worker.postMessage({ seasons: A.seasons, primaryIdx: A.primaryIdx, settings: A.settings, cfg: A.cfg, rookies: window.ROOKIE_POOL || [],
+        overrides: A.overrides || {}, teams: A.teams, myKey: A.myKey, picks: A.state.picks, runs, seed, oppBidNoise });
+    } else runOnMainThread(runs, seed, true, oppBidNoise);
+    if (A.ui.tab === 'strategy') renderPane();
+  }
+  function runOnMainThread(runs, seed, keep, oppBidNoise) {
+    if (!keep) A.sim = { startedAt: Date.now(), runs, seed, oppBidNoise, picks: A.state.picks.length, mode: 'main' };
+    const me = A.sim, sim = E.createSimulation(A.state, A.cfg, { runs, seed, oppBidNoise });
+    const tick = () => {
+      if (me.cancelled || A.sim !== me) return;
+      sim.step(Math.max(1, Math.round(runs / 50)));
+      simProgress(sim.completed, sim.total);
+      if (sim.done) finishSimulation(sim.result()); else setTimeout(tick, 0);
+    };
+    setTimeout(tick, 0);
+  }
+  function simulationHTML() {
+    const S = A.settings, r = A.simResult;
+    const pct = (x) => (x == null ? '—' : Math.round(x * 100) + '%');
+    const rng3 = (d, f) => `${f(d.mean)} (${f(d.p10)}–${f(d.p90)})`;
+    const controls = `<div class="row" style="align-items:end">
+        <label class="f">模擬次數<select id="sim-runs">${E.SIMULATION.runChoices.map((n) => `<option ${Number(A.ui.simRuns || 100) === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+        ${S.isAuction ? `<label class="f" title="對手出價上限 = 預期成交價 × (1 + 常態誤差)。誤差越大,多家競價時成交價越容易高於預期。這是假設,結果對它很敏感。">對手出價誤差 σ<select id="sim-noise">${[0, 0.05, 0.10, 0.15].map((v) => `<option value="${v}" ${Number(A.ui.simNoise == null ? E.SIMULATION.oppBidNoise : A.ui.simNoise) === v ? 'selected' : ''}>${v.toFixed(2)}</option>`).join('')}</select></label>` : ''}
+        <label class="f" title="相同種子會得到完全相同的結果;留空則隨機">種子 (選填)<input type="number" id="sim-seed" min="0" step="1" style="width:120px" value=""></label>
+        ${A.sim ? '<button class="btn danger" data-act="sim-cancel">取消</button>' : '<button class="btn primary" data-act="sim-run">開始模擬</button>'}
+        <span class="hint" id="sim-progress">${A.sim ? '準備中…' : ''}</span></div>`;
+    let body = '';
+    if (r) {
+      const stale = r.ranWithPicks !== A.state.picks.length || r.configFingerprint !== A.model.configFingerprint || r.personalFingerprint !== E.personalFingerprint(A.cfg);
+      const my = r.my;
+      const cats = my.categories.map((c) => `<tr><td>${esc(c.label)}</td><td class="num">${c.meanZ.toFixed(1)} (${c.p10Z.toFixed(1)}–${c.p90Z.toFixed(1)})</td><td class="num">${c.meanRank.toFixed(1)}</td><td class="num">${pct((c.rankDist[0] + (c.rankDist[1] || 0) + (c.rankDist[2] || 0)) / r.runs)}</td></tr>`).join('');
+      const players = r.players.filter((x) => x.pMine > 0).slice(0, 15).map((x) => `<tr><td>${esc(x.name)} <span class="ps">${esc(x.pos)}</span></td><td class="num">${pct(x.pMine)}</td>${S.isAuction ? `<td class="num">${x.avgPriceMine != null ? money(x.avgPriceMine) : '—'}</td><td class="num">${money(x.avgPrice)}</td>` : `<td class="num">${x.avgPick.toFixed(1)}</td>`}</tr>`).join('');
+      body = `${stale ? '<p class="verdict premium" style="font-weight:500">選秀狀態或設定在模擬之後已經改變,以下結果基於模擬當時的狀態。</p>' : ''}
+        <p class="hint">${r.runs} 場 · 種子 ${r.seed} · 從第 ${r.startedAtPick + 1} 手開始 · 估值模型 v${esc(r.modelVersion)} · 決策模型 v${esc(r.decisionVersion)} · ${r.mode === 'worker' ? '背景執行' : '主執行緒'} · ${(r.elapsedMs / 1000).toFixed(1)} 秒</p>
+        <p class="hint">模擬結果 (heuristic):${esc(r.assumptions.myPolicy)};${esc(r.assumptions.opponentPolicy)}。真實對手的行為可能完全不同,請當作「照模型選秀大概會得到什麼」的參考,不是預測。</p>
+        <div class="advice">
+          <div><b>${my.rosterFill.mean.toFixed(1)}</b><span>平均填滿名額</span></div>
+          ${S.isAuction ? `<div><b>${money(my.spent.mean)}</b><span>平均花費 (${money(my.spent.p10)}–${money(my.spent.p90)})</span></div><div><b>${money(my.leftover.mean)}</b><span>平均剩餘預算</span></div>` : ''}
+          <div><b>${my.valueRank.mean.toFixed(1)}</b><span>陣容總價值的聯盟排名 (平均)</span></div>
+          <div><b>${pct(my.valueRank.rankDist.slice(0, 3).reduce((a, b) => a + b, 0) / r.runs)}</b><span>陣容總價值前 3 名的比例</span></div>
+        </div>
+        <div class="grid2">
+          <div><b>類別 (我方陣容 z 總和)</b><table class="mini"><thead><tr><th>類別</th><th>平均 (p10–p90)</th><th>平均排名</th><th>前 3 名</th></tr></thead><tbody>${cats}</tbody></table></div>
+          <div><b>最常取得的球員</b><table class="mini"><thead><tr><th>球員</th><th>取得比例</th>${S.isAuction ? '<th>我方平均成交</th><th>全體平均成交</th>' : '<th>平均順位</th>'}</tr></thead><tbody>${players || '<tr><td class="hint">—</td></tr>'}</tbody></table>
+            <p class="hint">位置 (平均人數):${my.positions.map((x) => `${x.pos} ${x.mean.toFixed(1)}`).join(' · ')}</p></div>
+        </div>`;
+    }
+    return `<div class="sec"><h3>選秀模擬 (Monte Carlo)</h3><p class="hint">從目前的選秀狀態模擬到結束多次:我方照模型建議行動,對手依假設的行為模式。100 場約需 5–15 秒,1000 場可能超過 1 分鐘 (依球員數與隊數)。</p>${controls}${body}</div>`;
+  }
+
+  // ------------------------------------------------------------------ 畫面:現場模式 (Phase 4,Draft Day Mode)
+  function liveHitsHTML() {
+    const q = E.normName(A.ui.liveQ || '');
+    if (!q) return '';
+    const drafted = A.state.draftedIds();
+    return A.state.model.players.filter((p) => !drafted.has(p.pid) && (p.valid || p.isRookie) && E.normName(p.name).includes(q)).slice(0, 6)
+      .map((p) => `<button class="chip" data-act="live-set" data-pid="${esc(p.pid)}">${esc(p.name)} <span class="ps">${esc((p.pos || []).join('/'))}</span></button>`).join('') || '<span class="hint">找不到可選的球員</span>';
+  }
+  function targetChips(list) {
+    return list.map((r) => `<button class="chip" data-act="live-set" data-pid="${esc(r.pid)}" title="陣容邊際價值 ${r.mrv.toFixed(1)}">${r.priority === 'high' ? '★ ' : ''}${esc(r.name)} <span class="ps">${esc(r.pos)}</span></button>`).join('') || '<span class="hint">沒有符合條件的球員</span>';
+  }
+  function renderLive() {
+    const el = $('#live'); if (!el) return;
+    if (!A.state || !A.ui.live) { el.hidden = true; el.innerHTML = ''; return; }
+    el.hidden = false;
+    const st = A.state, S = A.settings, a = st.currentAuction;
+    const teamOpts = (sel) => [A.teams.find((t) => t.key === A.myKey), ...A.teams.filter((t) => t.key !== A.myKey)].map((t) => `<option value="${esc(t.key)}" ${t.key === sel ? 'selected' : ''}>${t.key === A.myKey ? '我 — ' : ''}${esc(t.name)}</option>`).join('');
+    const picker = `<div class="row" style="align-items:center"><input type="search" id="live-q" placeholder="搜尋並設定目前球員" aria-label="搜尋並設定目前球員" autocomplete="off" value="${esc(A.ui.liveQ || '')}" style="width:220px"><div id="live-hits" class="row" style="gap:4px">${liveHitsHTML()}</div></div>`;
+    const head = `<div class="panel-h"><h2>現場模式</h2><span class="hint">${S.isAuction ? '拍賣' : 'Snake'} · 數字全部來自模型;BUY/WAIT/PASS 為建議,由你決定</span></div>`;
+    if (!a) {
+      el.innerHTML = `${head}<div class="panel-b stack"><p class="hint">尚未設定目前球員。可從球員詳情、推薦卡片或下方目標設定。</p>${picker}
+        <div><b>下一批目標</b> <span class="hint">★ = 你標記的高優先;其餘依陣容邊際價值</span><div class="row" style="gap:4px;margin-top:6px">${targetChips(E.nextTargets(st, A.cfg))}</div></div></div>`;
+      return;
+    }
+    const d = E.liveDecision(st, A.cfg);
+    const cls = { BUY: 'cheap', WAIT: 'premium', PASS: 'stop' }[d.decision] || '';
+    let controls;
+    if (S.isAuction) {
+      const bids = d.auction.bids.slice(-5).reverse().map((b) => `<div class="num">${esc(st.teamName(b.teamKey))} <b>${money(b.amount)}</b></div>`).join('') || '<span class="hint">尚無出價</span>';
+      const nextAmt = d.auction.currentBid == null ? S.minBid : d.auction.currentBid + 1;
+      controls = `<div class="row"><label class="f">提名隊伍<select id="live-nom"><option value="">—</option>${teamOpts(d.auction.nominatedBy)}</select></label>
+          <div><span class="hint">目前叫價</span><div class="num" style="font-size:22px;font-weight:700">${d.auction.currentBid == null ? '—' : money(d.auction.currentBid)} <span class="ps">${d.auction.highBidder ? esc(st.teamName(d.auction.highBidder)) : ''}</span></div></div></div>
+        <div class="row"><label class="f">出價隊伍<select id="live-bidder">${teamOpts(A.myKey)}</select></label><label class="f">金額<input type="number" id="live-amt" min="${S.minBid}" step="1" value="${nextAmt}" inputmode="numeric"></label>
+          <button class="btn" data-act="live-bid">記錄出價</button><button class="btn sm" data-act="live-undo-bid" ${d.auction.bids.length ? '' : 'disabled'}>撤銷最後出價</button></div>
+        <div class="stack" style="gap:2px"><span class="hint">最近出價</span>${bids}</div>
+        <div class="row"><button class="btn primary" data-act="live-complete" ${d.auction.highBidder ? '' : 'disabled'}>成交</button><button class="btn danger" data-act="live-cancel">取消</button></div>`;
+    } else {
+      const oc = E.teamOnClock(st, A.cfg);
+      controls = `<div class="row"><label class="f">誰選走<select id="live-team">${teamOpts(oc ? oc.key : A.myKey)}</select></label><span class="hint">輪到:${oc ? esc(oc.name) : '—'} (第 ${st.picksMade() + 1} 手)</span></div>
+        <div class="row"><button class="btn primary" data-act="live-complete">記錄選走</button><button class="btn danger" data-act="live-cancel">取消</button></div>`;
+    }
+    const m = d.mine;
+    const mine = !m ? '<p class="hint">沒有估值資料。</p>' : (S.isAuction
+      ? `<div class="advice"><div><b>${money(m.personalValue)}</b><span>對我的價值${m.personalValue !== m.modelWorth ? ' (含手動調整)' : ''}</span></div><div><b>${money(m.expectedPrice)}</b><span>預期成交</span></div><div class="go"><b>${money(m.recommendedBid)}</b><span>建議出價</span></div><div class="stop"><b>${money(m.maxBid)}</b><span>放棄上限</span></div><div><b>${money(m.legalMax)}</b><span>合法最高出價</span></div><div><b>${m.mrv.toFixed(1)}</b><span>陣容邊際價值</span></div></div>`
+      : `<div class="advice"><div><b>${m.survival ? Math.round(m.survival.estimate * 100) + '%' : '—'}</b><span>${m.survival ? `估計撐到 #${m.survival.targetPick} (模型估計)` : '生存估計'}</span></div><div><b>${m.mrv.toFixed(1)}</b><span>陣容邊際價值</span></div></div>`);
+    const threats = d.threats.map((t) => `<div>${esc(t.teamName)} <span class="ps">${S.isAuction ? `最高可出 ${money(t.maxBid)} · ` : ''}${t.fillsStarter ? '可補先發' : '板凳'}</span> <span class="tag ${t.level === 'HIGH' ? 'inj' : (t.level === 'MEDIUM' ? 'gold' : '')}">${{ HIGH: '高', MEDIUM: '中', LOW: '低' }[t.level]}</span></div>`).join('') || '<span class="hint">沒有明顯的競爭對手</span>';
+    el.innerHTML = `${head}<div class="panel-b live-grid">
+      <div class="stack"><div><span class="rec-name" style="font-size:20px">${esc(d.name)}</span> <span class="ps">${esc(d.pos)}</span></div>${controls}${picker}</div>
+      <div class="stack"><div class="verdict big ${cls}">${esc(d.decision || '—')}</div><p class="rec-why">${esc(d.reasons.join(';'))}</p>${mine}
+        <div><b>競爭</b> <span class="hint">模型估計 (heuristic)</span>${threats}</div>
+        <div><b>下一批目標</b><div class="row" style="gap:4px;margin-top:6px">${targetChips(d.nextTargets)}</div></div></div></div>`;
   }
 
   // ------------------------------------------------------------------ 畫面:我的陣容 / 各隊
@@ -1248,10 +2996,12 @@ window.ROOKIE_POOL = [
     $('#poschips').innerHTML = ['ALL', ...E.POSITIONS, 'G', 'F'].map((p) => `<button class="chip ${ui.pos === p ? 'on' : ''}" data-act="pos" data-pos="${p}">${p === 'ALL' ? '全部' : p}</button>`).join('');
     $('#aff-wrap').hidden = !S.isAuction;
     $('#f-aff').checked = ui.affordable; $('#f-gone').checked = ui.showDrafted;
-    const twoSeasons = A.seasons.length === 2;
-    $('#season-wrap').hidden = !twoSeasons; $('#cmp-wrap').hidden = !twoSeasons;
-    if (twoSeasons) {
-      $('#f-season').innerHTML = A.seasons.map((sn, i) => `<option value="${i}" ${i === A.primaryIdx ? 'selected' : ''}>${esc(sn.label)}</option>`).join('');
+    const multiSeason = A.seasons.length >= 2;
+    $('#season-wrap').hidden = !multiSeason; $('#cmp-wrap').hidden = !multiSeason;
+    if (multiSeason) {
+      const rawOpts = A.seasons.map((sn, i) => `<option value="${i}" ${i === A.primaryIdx ? 'selected' : ''}>${esc(sn.label)}</option>`).join('');
+      const blendOpt = `<option value="blend" ${isBlendMode() ? 'selected' : ''}>${A.seasons.length} 季歷史混合</option>`;
+      $('#f-season').innerHTML = rawOpts + blendOpt;
       $('#f-cmp').checked = ui.showCmp;
     }
     const q = E.normName(ui.q);
@@ -1270,9 +3020,9 @@ window.ROOKIE_POOL = [
       const ev = evs.get(p.pid), pk = drafted.get(p.pid);
       const cellsCat = cats.map((c, i) => `<td style="${heat(p.zv[i])}">${fmtStat(statOf(p, c), c)}${deltaBadge(statOf(p, c), p.cmp ? statOf(p.cmp, c) : null, c.key, c.higherBetter)}</td>`).join('');
       const mpgCell = (E.isNum(p.min) ? p.min.toFixed(1) : '–') + deltaBadge(p.min, p.cmp ? p.cmp.min : null, 'min', true);
-      return `<tr data-act="open-player" data-pid="${esc(p.pid)}" class="${pk ? 'gone' : ''}"><td class="l"><span class="pn">${esc(p.name)}</span><span class="ps">${esc((p.pos || []).join('/'))} ${esc(p.team || '')}</span>${p.status && p.status !== 'NA' ? `<span class="tag inj">${esc(p.status)}</span>` : ''}${pk ? `<span class="tag">${esc(st.teamName(pk.teamKey))}</span>` : ''}</td>
+      return `<tr data-act="open-player" data-pid="${esc(p.pid)}" class="${pk ? 'gone' : ''}"><td class="l"><span class="pn">${esc(p.name)}</span><span class="ps">${esc((p.pos || []).join('/'))} ${esc(p.team || '')}</span>${p.status && p.status !== 'NA' ? `<span class="tag inj">${esc(p.status)}</span>` : ''}${pk ? `<span class="tag">${esc(st.teamName(pk.teamKey))}</span>` : ''}${ovTags(E.overrideFor(st, p))}</td>
         <td>${mpgCell}</td>
-        <td>${(p.value - st.model.replZ).toFixed(1)}</td>
+        <td>${p.aboveRepl.toFixed(1)}</td>
         ${S.isAuction ? `<td>${money(p.dollars)}</td><td class="worth">${ev ? money(ev.worth) : '–'}</td>` : `<td>${E.isNum(p.adp) ? p.adp.toFixed(0) : '–'}</td>`}${cellsCat}</tr>`;
     }).join('');
     $('#pl-table').innerHTML = shown.length ? `<table class="pl"><thead>${head}</thead><tbody>${body}</tbody></table>${list.length > shown.length ? `<div class="empty"><button class="btn" data-act="more">再顯示 100 筆 (共 ${list.length} 筆符合)</button></div>` : ''}` : '<div class="empty">沒有符合的球員。試試清除搜尋或位置篩選。</div>';
@@ -1282,7 +3032,8 @@ window.ROOKIE_POOL = [
   // ------------------------------------------------------------------ 畫面:選秀紀錄 / 策略
   function renderLog() {
     const st = A.state, S = A.settings, el = $('#pane-log');
-    const items = st.picks.slice().reverse().map((p) => `<div class="log-i ${p.teamKey === A.myKey ? 'me' : ''}"><span class="num muted">#${p.pickNo}</span><span><b>${esc(st.get(p.pid).name)}</b> <span class="ps">${esc((st.get(p.pid).pos || []).join('/'))}</span></span><span>${esc(st.teamName(p.teamKey))}</span><span class="num">${S.isAuction ? money(p.price) : ''}</span><button class="x" data-act="remove-pick" data-pid="${esc(p.pid)}" title="刪除這筆" aria-label="刪除這筆">×</button></div>`).join('');
+    const snapTitle = (sn) => (!sn ? '沒有成交快照' : `估值模型 v${sn.modelVersion || '未標'} · ${sn.timestamp ? new Date(sn.timestamp).toLocaleString('zh-TW', { hour12: false }) : ''} · 基礎價 ${money(sn.fairValue != null ? sn.fairValue : sn.modelDollars)} · 預期成交 ${money(sn.marketValue != null ? sn.marketValue : sn.expectedPrice)}${sn.personalValue != null ? ' · 對我 ' + money(sn.personalValue) : ''}`);
+    const items = st.picks.slice().reverse().map((p) => `<div class="log-i ${p.teamKey === A.myKey ? 'me' : ''}" title="${esc(snapTitle(p.snap))}"><span class="num muted">#${p.pickNo}</span><span><b>${esc(st.get(p.pid).name)}</b> <span class="ps">${esc((st.get(p.pid).pos || []).join('/'))}</span></span><span>${esc(st.teamName(p.teamKey))}</span><span class="num">${S.isAuction ? money(p.price) : ''}</span><button class="x" data-act="remove-pick" data-pid="${esc(p.pid)}" title="刪除這筆" aria-label="刪除這筆">×</button></div>`).join('');
     const sim = A.source === 'demo' ? `<div class="pane-pad"><button class="btn" data-act="sim" data-n="5">模擬他隊選 5 手</button> <button class="btn" data-act="sim" data-n="20">模擬 20 手</button> <span class="hint">Demo 專用,用來測試推薦如何隨選秀改變。</span></div>` : '';
     el.innerHTML = `${sim}<div class="log">${items || '<div class="empty">還沒有選秀紀錄。在球員池點一名球員就能記錄。</div>'}</div>`;
   }
@@ -1322,6 +3073,7 @@ window.ROOKIE_POOL = [
     const rep = E.strategyReport(A.state, A.cfg), S = A.settings, el = $('#pane-strategy');
     const li = (a) => a.map((x) => `<li>${esc(x)}</li>`).join('');
     el.innerHTML = `<div class="pane-pad">
+      ${simulationHTML()}
       <div class="sec"><h3>聯盟規模</h3><p>全聯盟共 ${rep.nSlots} 個名額,其中先發 ${rep.nStarters} 個;估值涵蓋 ${rep.nValued} 名球員。</p>${rep.notes.length ? `<ul>${li(rep.notes)}</ul>` : ''}</div>
       <div class="grid2">
       <div class="sec"><h3>類別稀缺度</h3><p class="hint">偏態越高,代表少數球員壟斷該類別,越該早買;偏態低的類別後期容易補。</p><table class="mini"><thead><tr><th>類別</th><th>偏態</th><th>判斷</th></tr></thead><tbody>${rep.scarcity.map((r) => `<tr><td>${esc(r.label)}</td><td class="num">${r.skew.toFixed(2)}</td><td>${r.tag === '稀缺' ? '<span class="tag gold">稀缺</span>' : r.tag}</td></tr>`).join('')}</tbody></table></div>
@@ -1330,7 +3082,36 @@ window.ROOKIE_POOL = [
         : `<div class="sec"><h3>各輪目標區間</h3><table class="mini"><tbody>${rep.rounds.map((r) => `<tr><td>第 ${r.round} 輪</td><td class="num">#${r.from}–${r.to}</td><td style="text-align:left">${esc(r.names.join('、'))}</td></tr>`).join('')}</tbody></table></div>`}
       <div class="sec"><h3>${S.isAuction ? '預算配置建議' : '選秀建議'}</h3><ul>${li(rep.plan)}</ul></div>
       ${rep.weights.length ? `<div class="sec"><h3>已調整的類別權重</h3><ul>${rep.weights.map((x) => `<li>${esc(x.label)}:${esc(weightTag(x.weight))}${x.weight === 0 ? ' (推薦與「對我」價值會忽略)' : ''}</li>`).join('')}</ul></div>` : ''}
-      <div class="sec"><h3>平均先發陣容的單場水準</h3><p class="hint">全聯盟平均先發球員的場均數據 × 先發人數,可當作各類別的參考門檻。</p><p class="num">${rep.targets.map((t) => `${esc(t.label)} ${t.text}`).join('　')}</p></div></div>`;
+      <div class="sec"><h3>平均先發陣容的單場水準</h3><p class="hint">全聯盟平均先發球員的場均數據 × 先發人數,可當作各類別的參考門檻。</p><p class="num">${rep.targets.map((t) => `${esc(t.label)} ${t.text}`).join('　')}</p></div>
+      ${A.seasons.length >= 2 ? (() => {
+        const comp = HM.summarizeHistoricalCompleteness(A.state.model.players.filter((p) => p.valid));
+        return `<div class="sec"><h3>歷史資料完整度</h3><p class="hint">依「上傳了幾季資料」分組,球季數越少的球員,估值的不確定性越高,選秀時可酌情保守一點。</p>
+          <table class="mini"><tbody>
+            <tr><td>3 季都有資料</td><td class="num">${comp.counts[3]} 人</td></tr>
+            <tr><td>2 季有資料</td><td class="num">${comp.counts[2]} 人</td></tr>
+            <tr><td>只有 1 季資料</td><td class="num">${comp.counts[1]} 人</td></tr>
+          </tbody></table></div>`;
+      })() : ''}
+      ${calibrationHTML()}
+      <p class="hint" style="margin-top:12px">估值模型 v${esc(A.model.modelVersion)} · 決策模型 v${esc(A.model.decisionVersion)} · 全域設定指紋 ${esc(A.model.configFingerprint || '—')} · 個人化設定指紋 ${esc(E.personalFingerprint(A.cfg))}</p>
+      </div>`;
+  }
+  function calibrationHTML() {
+    const S = A.settings;
+    if (!S.isAuction) return '<div class="sec"><h3>市場校準</h3><p class="hint">Snake 沒有成交價,市場校準只適用拍賣。</p></div>';
+    const cur = E.calibrationRecords(A.state, A.draftId);
+    const past = Object.entries(loadCalHistory().drafts).filter(([id]) => id !== A.draftId);
+    const scope = A.ui.calScope === 'all' ? 'all' : 'current';
+    const recs = scope === 'all' ? cur.concat(...past.map(([, d]) => d.records)) : cur;
+    const c = E.computeCalibration(recs, S);
+    const fmt = (g) => (g.insufficient ? '<span class="muted">Insufficient sample</span>' : `<b class="num">${g.pct >= 0 ? '+' : ''}${(g.pct * 100).toFixed(0)}%</b>`);
+    const table = (title, list) => `<div><b>${title}</b><table class="mini"><tbody>${list.map((g) => `<tr><td>${esc(g.key)}</td><td class="num">${g.n} 筆</td><td>${fmt(g)}</td></tr>`).join('') || '<tr><td class="hint">尚無資料</td></tr>'}</tbody></table></div>`;
+    return `<div class="sec"><h3>市場校準</h3><p class="hint">實際觀察 (observed):實際成交價 ÷ 成交當下模型的預期成交價。+ 代表市場付得比模型預期多。僅供參考,<b>不會影響任何估值</b>;少於 ${c.minSample} 筆的組別不顯示數字。</p>
+      <div class="row" style="gap:6px;align-items:center"><button class="chip ${scope === 'current' ? 'on' : ''}" data-act="cal-scope" data-scope="current">本次選秀 (${cur.length} 筆)</button><button class="chip ${scope === 'all' ? 'on' : ''}" data-act="cal-scope" data-scope="all">含歷史 (${past.length} 次選秀)</button>
+        <button class="btn sm" data-act="cal-archive">存入歷史</button>${past.length ? '<button class="btn sm danger" data-act="cal-clear">清除歷史</button>' : ''}</div>
+      <p class="hint" style="margin-top:6px">只比對估值模型 v${esc(c.comparedMajor)}.x 的紀錄 (同一主版本的數字保證相同)${Object.keys(c.excluded).length ? `;另有 ${Object.entries(c.excluded).map(([k, n]) => `${k === 'unversioned' ? '未標版本' : 'v' + esc(k)} ${n} 筆`).join('、')} 未列入 (不同主版本的模型價不能直接比較)` : ''}。</p>
+      <p style="margin-top:4px">整體:${c.overall.n} 筆,${fmt(c.overall)}</p>
+      <div class="grid2">${table('位置', c.groups.position)}${table('球員層級', c.groups.tier)}${table('預期價格區間', c.groups.priceRange)}${table('選秀階段', c.groups.stage)}${table('主要強項類別', c.groups.category)}</div></div>`;
   }
   function renderPane() {
     const t = A.ui.tab;
@@ -1342,7 +3123,7 @@ window.ROOKIE_POOL = [
   function renderAll() {
     const has = !!A.state;
     $('#welcome').hidden = has; $('#workspace').hidden = !has; $('#side').hidden = !has;
-    if (has) { renderRecs(); renderRookies(); renderTeamPanel(); renderTeams(); }
+    if (has) { renderLive(); renderRecs(); renderRookies(); renderTeamPanel(); renderTeams(); }
     renderBoard(); renderPane();
   }
 
@@ -1369,7 +3150,7 @@ window.ROOKIE_POOL = [
     else if (!rec) advice = `<p class="hint">此球員缺少完整統計無法估值,或選他會讓你湊不齊先發位置。仍可記錄選秀。</p>`;
     else if (S.isAuction) advice = `<div class="advice"><div><b>${money(rec.market)}</b><span>模型市價</span></div><div><b>${money(rec.fair)}</b><span>預期成交價 (含通膨)</span></div><div><b>${money(rec.worth)}</b><span>對我的價值</span></div><div class="go"><b>${money(rec.target)}</b><span>建議出價</span></div><div class="stop"><b>${money(rec.ceiling)}</b><span>放棄上限</span></div><div><b>${money(ctx.maxBid)}</b><span>我最高可出</span></div></div>
       <label class="f">場上目前叫價 (輸入後立刻判斷)<input type="number" id="bid" min="0" step="1" inputmode="numeric" data-role="bid" style="width:120px" autofocus></label><div id="verdict" class="verdict" hidden></div>`;
-    else advice = `<div class="advice"><div><b>${rec.adp ? rec.adp.toFixed(1) : '–'}</b><span>ADP</span></div><div><b>${(rec.var).toFixed(1)}</b><span>高於替補 (個人化)</span></div>${rec.tag ? `<div><b style="font-size:17px">${esc(rec.tag)}</b><span>時機判斷</span></div>` : ''}</div>`;
+    else advice = `<div class="advice"><div><b>${rec.adp ? rec.adp.toFixed(1) : '–'}</b><span>ADP</span></div><div><b>${(rec.var).toFixed(1)}</b><span>高於替補 (個人化)</span></div>${rec.tag ? `<div><b style="font-size:17px">${esc(rec.tag)}</b><span>時機判斷</span></div>` : ''}${rec.survival ? `<div title="heuristic:以常態分佈近似被選順位 (平均 = ${esc(rec.survival.basis)} ${rec.survival.edp.toFixed(1)},σ = ${rec.survival.sigma.toFixed(1)}),並以他目前仍未被選為條件。不是統計驗證的機率。"><b>${Math.round(rec.survival.estimate * 100)}%</b><span>估計撐到 #${rec.survival.targetPick} (${esc(rec.survival.suggestion)},模型估計)</span></div>` : ''}</div>`;
     let cmpSection = '';
     if (p.cmp) {
       const fmtNum = (v, key) => {
@@ -1385,14 +3166,59 @@ window.ROOKIE_POOL = [
         const cls = d == null || d === 0 ? '' : ((d > 0) === r.higherBetter ? 'up' : 'down');
         return `<tr><td class="l">${esc(r.label)}</td><td>${fmtNum(r.cur, r.key)}</td><td>${fmtNum(r.prev, r.key)}</td><td class="delta ${cls}">${d == null ? '–' : fmtDeltaVal(d, r.key)}</td></tr>`;
       }).join('');
-      cmpSection = `<div class="stack"><b>跨季比較</b><table class="mini cmp-table"><thead><tr><th class="l"></th><th>${esc(A.seasons[A.primaryIdx].label)}</th><th>${esc(p.cmpLabel)}</th><th>年增減</th></tr></thead><tbody>${trs}</tbody></table>
+      cmpSection = `<div class="stack"><b>跨季比較</b><table class="mini cmp-table"><thead><tr><th class="l"></th><th>${esc(primaryLabel())}</th><th>${esc(p.cmpLabel)}</th><th>年增減</th></tr></thead><tbody>${trs}</tbody></table>
         <span class="hint">MPG 明顯增加,通常代表球隊更信任這名球員,角色吃重;明顯減少則要留意是否被新秀或交易對象分掉上場時間。</span></div>`;
+    }
+    let availSection = '';
+    if (p.valid) {
+      const na = '<span class="muted">–</span>';
+      const num = (v, d) => (E.isNum(v) ? v.toFixed(d == null ? 2 : d) : na);
+      const gp = (v) => (E.isNum(v) ? v.toFixed(1) + ' 場' : na);
+      const sgn = (v) => (E.isNum(v) ? (v >= 0 ? '+' : '') + v.toFixed(2) : na);
+      const mrvTile = rec ? `<div><b>${num(rec.mrv)}</b><span>陣容邊際價值 (高於替補線)</span></div>` : '';
+      const vt = p.valueTiers;
+      const tiersHTML = vt ? `<p class="hint" style="margin:4px 0 0">三層估值使用同一個聯盟經濟 (替補線、每分幣值、稀缺加成),只差在出勤調整;這是目前狀態下的分解,不是「沒有手動調整時」的反事實價格。</p><div class="advice"><div><b>${money(vt.base.dollars)}</b><span>基礎價 (不含出勤)</span></div><div><b>${money(vt.availability.dollars)}</b><span>歷史出勤調整後</span></div><div><b>${money(vt.risk.dollars)}</b><span>風險調整後${vt.risk.source.includes('override') ? ' (含手動 GP 調整)' : ''} = 模型價</span></div></div>` : '';
+      const pr = p.projectionRange;
+      const rangeHTML = !pr ? '' : (pr.insufficient
+        ? `<p class="hint">季間範圍:${esc(pr.reason)}</p>`
+        : `<div class="advice" title="estimated:把每一季的實際數據放進同一估值尺度計分後的高低範圍 (${pr.n} 季),不是統計信賴區間。"><div><b>${money(pr.low.dollars)}</b><span>保守 (最差一季)</span></div><div><b>${money(pr.median.dollars)}</b><span>中位</span></div><div><b>${money(pr.high.dollars)}</b><span>樂觀 (最佳一季)</span></div><div><b>${pr.n} 季</b><span>估計依據 (季間範圍)</span></div></div>`);
+      const statusHTML = p.status && p.status !== 'NA' ? `<p class="hint">傷病狀態「${esc(p.status)}」僅供參考,不會自動影響任何一層價值。</p>` : '';
+      availSection = `<div class="stack"><b>估值拆解</b><span class="hint">基礎分數 → 依歷史出勤調整 (只作用在正分) → 加上聯盟位置稀缺 → 全域價值。陣容邊際價值 = 加入後我方陣容價值增加多少 (以替補線為 0),已考慮位置重疊;與上方「高於替補」同一尺度。</span>
+        <div class="advice"><div><b>${num(p.baseScore)}</b><span>基礎分數</span></div><div><b>${num(p.availMult, 3)}×</b><span>出勤係數 (已套用強度)</span></div><div><b>${num(p.riskScore)}</b><span>出勤調整後</span></div><div><b>${sgn(p.scarcityBonus)}</b><span>位置稀缺加成</span></div><div><b>${num(p.value)}</b><span>全域價值</span></div>${mrvTile}</div>
+        <div class="advice"><div><b>${E.isNum(p.historySeasonsAvailable) ? p.historySeasonsAvailable : na}</b><span>可用歷史季數</span></div><div><b>${gp(p.historicalExpectedGp)}</b><span>歷史期望出賽</span></div><div><b>${gp(p.finalExpectedGp)}</b><span>最終期望出賽 (40–79)</span></div><div><b>${num(p.availabilityMultiplier, 3)}×</b><span>規格出勤係數</span></div></div>${tiersHTML}${rangeHTML}${statusHTML}</div>`;
+    }
+    let threatSection = '';
+    if (!pk && p.valid) {
+      const th = E.analyzeThreat(st, A.cfg, pid);
+      const lv = { HIGH: '<span class="tag inj">高</span>', MEDIUM: '<span class="tag gold">中</span>', LOW: '<span class="tag">低</span>', NONE: '<span class="muted">—</span>' };
+      const pct = (v) => Math.round(v * 100) + '%';
+      const rows = th.rows.filter((r) => r.level !== 'NONE').slice(0, 6).map((r) => `<tr><td>${esc(r.teamName)}</td>${S.isAuction ? `<td class="num">${money(r.budgetLeft)}</td><td class="num">${money(r.maxBid)}</td><td class="num">${pct(r.factors.budget)}</td>` : ''}<td>${r.fillsStarter ? '可補先發' : (r.factors.position > 0 ? '只能板凳' : '—')}</td><td class="num">${pct(r.factors.category)}</td><td class="num">${r.starterOpen}/${r.openSpots}</td><td class="num">${r.score.toFixed(2)}</td><td>${lv[r.level]}</td></tr>`).join('');
+      threatSection = `<div class="stack"><b>競爭分析 <span class="hint" style="font-weight:400">模型估計 (heuristic)</span></b>
+        <span class="hint">威脅 = ${S.isAuction ? '預算能力 × ' : ''}(0.5 位置 + 0.3 類別契合 + 0.2 先發空缺比例)。高 ≥ 0.60、中 ≥ 0.35。${S.isAuction ? `預期成交 ${money(th.expectedPrice)};` : ''}有能力且有需求的對手 ${th.summary.capable} 隊 (高威脅 ${th.summary.high}、中 ${th.summary.medium})。</span>
+        ${rows ? `<div style="overflow-x:auto"><table class="mini"><thead><tr><th>隊伍</th>${S.isAuction ? '<th>剩餘</th><th>最高可出</th><th>預算能力</th>' : ''}<th>位置</th><th>類別契合</th><th>先發缺/空位</th><th>分數</th><th>威脅</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="hint">目前沒有對手會與你競爭這名球員。</p>'}</div>`;
     }
     const why = rec && rec.reasons.length ? `<p class="rec-why">${esc(rec.reasons.join(';'))}</p>` : '';
     const teamOpts = [A.teams.find((t) => t.key === A.myKey), ...A.teams.filter((t) => t.key !== A.myKey)].map((t) => `<option value="${esc(t.key)}">${t.key === A.myKey ? '我 — ' : ''}${esc(t.name)}${S.isAuction ? ` (最高可出 ${money(st.maxBid(t.key))})` : ''}</option>`).join('');
     const form = pk ? `<div class="row"><button class="btn danger" data-act="remove-pick" data-pid="${esc(pid)}">撤銷這筆選秀</button></div>`
       : `<div class="row"><label class="f">誰選走了<select id="pk-team">${teamOpts}</select></label>${S.isAuction ? `<label class="f">成交價<input type="number" id="pk-price" min="0" step="1" value="${rec ? rec.target : S.minBid}" inputmode="numeric"></label>` : ''}<button class="btn primary" data-act="submit-pick">記錄選秀</button></div>`;
-    openModal(`${modalHead(esc(p.name), `${esc((p.pos || []).join('/'))} ${esc(p.team || '')}${p.status ? ' 傷病:' + esc(p.status) : ''}${p.valid && p.zv ? ` 　高於替補 ${(p.value - st.model.replZ).toFixed(1)}` : ''}`)}<div class="modal-b"><div class="pstats">${tiles}</div>${advice}${why}${cmpSection}${form}</div>`, true);
+    // Phase 4:手動調整 (以穩定身分 sid 保存;模型值 + 使用者調整 = 最終決策值,不覆寫模型資料)
+    let ovSection = '';
+    if (!pk) {
+      const ov = E.overrideFor(st, p) || {};
+      const v = (x) => (x == null || x === 0 ? '' : x);
+      const effect = rec && S.isAuction ? `模型對我的價值 ${money(rec.worth)} → 最終決策值 ${money(rec.decisionWorth)}` : (rec ? `決策分數 ${rec.decisionScore.toFixed(2)} (模型 ${rec.score.toFixed(2)})` : '');
+      ovSection = `<details class="stack" ${ov.key ? 'open' : ''}><summary><b>手動調整</b> <span class="hint" style="font-weight:400">${ov.key ? '已套用' + (ov.matchedBy === 'nameKey' ? ' (依姓名對應)' : '') : '未設定'}${effect ? ';' + esc(effect) : ''}</span></summary>
+        <div class="row" style="margin-top:6px">
+          ${S.isAuction ? `<label class="f" title="只影響「對我的價值」與建議出價,不改變全域價值">價值調整 ($ ±)<input type="number" id="ov-value" step="1" value="${v(ov.valueAdjustment)}" style="width:90px"></label>` : `<label class="f" title="只影響推薦排序,不改變全域價值">價值調整 ($ ±)<input type="number" id="ov-value" step="1" value="${v(ov.valueAdjustment)}" style="width:90px"></label>`}
+          <label class="f" title="會進入估值的「風險調整後」層 (規格允許的唯一管道)">出賽數調整 (場 ±)<input type="number" id="ov-gp" step="1" value="${v(ov.gpAdjustment)}" style="width:90px"></label>
+          ${S.isAuction ? `<label class="f">目標價 ($)<input type="number" id="ov-target" min="0" step="1" value="${ov.targetPrice == null ? '' : ov.targetPrice}" style="width:90px"></label>` : ''}
+          <label class="f">優先<select id="ov-priority">${[['normal', '一般'], ['high', '★ 高'], ['low', '低']].map(([k, l]) => `<option value="${k}" ${(ov.priority || 'normal') === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label style="display:inline-flex;gap:5px;align-items:center"><input type="checkbox" id="ov-dnd" ${ov.doNotDraft ? 'checked' : ''}> 不選</label>
+          <button class="btn sm primary" data-act="save-override" data-pid="${esc(pid)}">儲存調整</button>${ov.key ? `<button class="btn sm" data-act="clear-override" data-pid="${esc(pid)}">清除</button>` : ''}
+        </div></details>`;
+    }
+    const liveBtn = !pk ? `<button class="btn sm" data-act="live-set" data-pid="${esc(pid)}">${S.isAuction ? '設為目前拍賣' : '設為目前考慮'}</button>` : '';
+    openModal(`${modalHead(esc(p.name), `${esc((p.pos || []).join('/'))} ${esc(p.team || '')}${p.status ? ' 傷病:' + esc(p.status) : ''}${p.valid && p.zv ? ` 　高於替補 ${p.aboveRepl.toFixed(1)}` : ''}`)}<div class="modal-b"><div class="pstats">${tiles}</div>${advice}${why}${threatSection}${cmpSection}${availSection}${ovSection}${form}${liveBtn ? `<div class="row">${liveBtn}</div>` : ''}</div>`, true);
     A.modalPid = pid; // openModal() 會先清空,所以要在開啟之後才設定
   }
   function updateVerdict() {
@@ -1433,7 +3259,8 @@ window.ROOKIE_POOL = [
         <div class="cwlist" id="cw-box">${S.categories.map((k) => { const w = weightOf(k.label); return `<div class="cw-row" data-label="${esc(k.label)}"><span class="cw-label">${esc(k.label)}</span><input type="range" min="0" max="2" step="0.1" value="${w}" data-act="cfg-weight" data-label="${esc(k.label)}" aria-label="${esc(k.label)} 權重,目前 ${weightTag(w)}"><span class="cw-val ${w === 0 ? 'punt' : (w > 1 ? 'boost' : '')}">${weightTag(w)}</span></div>`; }).join('')}</div>
         <div class="row"><button class="btn sm" data-act="cfg-resetw">全部重設為 1.0×</button></div></div>
       <div class="row"><label class="f"><span>陣容平衡力度 (<span id="need-label">${c.needBeta.toFixed(1)}</span>)</span><input type="range" id="c-need" min="0" max="1" step="0.1" value="${c.needBeta}"></label>
-        <label class="f"><span>出賽數折扣 (<span id="gp-label">${c.gpWeight.toFixed(1)}</span>)</span><input type="range" id="c-gp" min="0" max="1" step="0.1" value="${c.gpWeight}"></label>
+        <label class="f" title="0 = 不依歷史出勤調整價值;1 = 完全照規格的出勤係數 (0.78–1.06)。只作用在正分球員。"><span>出勤調整強度 (<span id="avail-label">${Number(c.availStrength).toFixed(1)}</span>)</span><input type="range" id="c-avail" min="0" max="1" step="0.1" value="${c.availStrength}"></label>
+        <label class="f" title="板凳球員對「陣容邊際價值」的計入比例。0 = 只計算先發。"><span>板凳權重 (<span id="bench-label">${Number(c.benchWeight).toFixed(2)}</span>)</span><input type="range" id="c-bench" min="0" max="1" step="0.05" value="${c.benchWeight}"></label>
         <label class="f">推薦人數<select id="c-n">${[3, 4, 5].map((n) => `<option ${c.nRecs === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label></div>
       ${S.isAuction ? '' : `<label class="f">我的選秀順位 (1–${S.numTeams})<input type="number" id="c-slot" min="1" max="${S.numTeams}" value="${c.myDraftSlot || ''}"></label>`}
       ${A.source === 'bridge' ? `<label class="f">自動同步間隔 (秒)<input type="number" id="c-poll" min="3" max="120" value="${c.pollSeconds}"></label>` : ''}
@@ -1442,7 +3269,7 @@ window.ROOKIE_POOL = [
   }
   function saveSettings() {
     const c = A.cfg, S = A.settings;
-    c.needBeta = Number($('#c-need').value); c.gpWeight = Number($('#c-gp').value); c.nRecs = Number($('#c-n').value);
+    c.needBeta = Number($('#c-need').value); c.availStrength = Number($('#c-avail').value); c.benchWeight = Number($('#c-bench').value); c.nRecs = Number($('#c-n').value);
     const weights = {}; $$('#cw-box input[type=range]').forEach((el) => { weights[el.dataset.label] = Number(el.value); });
     c.catWeights = weights;
     c.puntCats = Object.keys(weights).filter((k) => weights[k] === 0); // 只為了相容舊版存檔/匯出,實際判斷一律看 catWeights
@@ -1476,7 +3303,12 @@ window.ROOKIE_POOL = [
           <label class="f">上一季標籤<input type="text" id="csv-label-prev" value="2024-25" style="width:110px"></label>
         </div>
         <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="csv-total-prev"> 上一季檔案是整季累計數據</label>
-        <p class="hint">兩季都上傳時,球員表格會多出 MPG 欄與年增減標示,點開球員可看完整跨季比較;之後也能在「設定」切換哪一季作為估值依據。</p>
+        <div class="row">
+          <label class="f">再上一季數據 (選填,三季一起可用「歷史混合」估值)<input type="file" id="csv-file-prev2" accept=".csv,text/csv"></label>
+          <label class="f">該季標籤<input type="text" id="csv-label-prev2" value="2023-24" style="width:110px"></label>
+        </div>
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="csv-total-prev2"> 該檔案是整季累計數據</label>
+        <p class="hint">上傳 2 季以上時,球員表格會多出 MPG 欄與年增減標示,點開球員可看完整跨季比較與歷史出勤估計;「設定」裡可以切換要用哪一季估值,或改用「N 季歷史混合」(依上傳順序給最新/次新/再上一季 50%/30%/20% 的權重,樣本數少的球季會自動打折,不會因為球員剛好受傷缺賽而被過度低估)。這個功能對任何隊數/預算/類別的聯盟都適用,不會被限定成某個特定聯盟的設定。</p>
         <p class="hint">欄位不限順序,可辨識 Player/Pos/GP/PTS/REB/AST/STL/BLK/TOV/FGM/FGA/FTM/FTA/3PM 等常見寫法。也可直接用 Basketball-Reference 的「Per Game」表 (Share &amp; Export → Get table as CSV),轉隊球員的重複列會自動合併。<a href="data:text/csv;charset=utf-8,${encodeURIComponent(CSV_TEMPLATE)}" download="projections_template.csv">下載範本</a></p>
         <div class="row"><label class="f">聯盟隊數<input type="number" id="l-teams" min="2" max="30" value="12"></label>
           <label class="f">選秀方式<select id="l-type"><option value="auction">拍賣選秀</option><option value="snake">Snake 選秀</option></select></label>
@@ -1510,21 +3342,40 @@ window.ROOKIE_POOL = [
     closeModal(); toast('已載入 Demo。到球員池點任一位球員,就能查價、記錄選秀。');
   }
   async function startCSV() {
-    const file = $('#csv-file').files[0]; if (!file) return setupError('請先選擇本季 CSV 檔案。');
+    const slots = [
+      { file: '#csv-file', label: '#csv-label', total: '#csv-total', fallback: '本季', required: true },
+      { file: '#csv-file-prev', label: '#csv-label-prev', total: '#csv-total-prev', fallback: '上一季', required: false },
+      { file: '#csv-file-prev2', label: '#csv-label-prev2', total: '#csv-total-prev2', fallback: '再上一季', required: false },
+    ];
+    const first = $(slots[0].file).files[0];
+    if (!first) return setupError('請先選擇本季 CSV 檔案。');
     const n = Number($('#l-teams').value), me = Number($('#l-me').value);
     if (!(n >= 2)) return setupError('隊數至少要 2 隊。');
     if (!(me >= 1 && me <= n)) return setupError(`「我是第幾隊」需在 1 到 ${n} 之間。`);
-    let parsed;
-    try { parsed = E.playersFromCSV(await readTextFile(file), { perGame: !$('#csv-total').checked }); } catch (e) { return setupError(e.message); }
-    const seasons = [{ label: $('#csv-label').value.trim() || '本季', players: parsed.players }];
-    const prevFile = $('#csv-file-prev').files[0];
-    let cmpWarning = '';
-    if (prevFile) {
+
+    const seasons = [];
+    const dataWarnings = [];
+    for (const slot of slots) {
+      const file = $(slot.file).files[0];
+      if (!file) continue;
+      const label = $(slot.label).value.trim() || slot.fallback;
+      let parsed;
       try {
-        const parsedPrev = E.playersFromCSV(await readTextFile(prevFile), { perGame: !$('#csv-total-prev').checked });
-        seasons.push({ label: $('#csv-label-prev').value.trim() || '上一季', players: parsedPrev.players });
-      } catch (e) { cmpWarning = '上一季 CSV 讀取失敗,已略過跨季比較功能:' + e.message; }
+        parsed = E.playersFromCSV(await readTextFile(file), { perGame: !$(slot.total).checked });
+      } catch (e) {
+        if (slot.required) return setupError(e.message);
+        dataWarnings.push(`「${label}」CSV 讀取失敗,已略過:${e.message}`);
+        continue;
+      }
+      seasons.push({ label, players: parsed.players, warnings: parsed.warnings });
+      // 規格 §22.1:資料合法性檢查,只警告不擋匯入 (CSV 難免有雜訊,擋死使用者反而更麻煩)。
+      const issues = HM.validatePlayerSeasonData(parsed.players.map((p) => Object.assign({}, p, { season: label })));
+      if (issues.length) {
+        const shown = issues.slice(0, 3).map((i) => i.message).join('; ');
+        dataWarnings.push(`「${label}」資料檢查發現 ${issues.length} 項可能異常 (例如:${shown})${issues.length > 3 ? ' 等' : ''},仍會照常匯入,建議之後回頭確認來源檔案。`);
+      }
     }
+
     const rosterSlots = {}; $$('[data-slot]').forEach((i) => { const v = Number(i.value) || 0; if (v > 0) rosterSlots[i.dataset.slot] = v; });
     if (!Object.keys(rosterSlots).some((k) => !['BN', 'IL'].includes(k))) return setupError('至少需要一個先發位置。');
     const keys = $$('input[name=cat]:checked').map((i) => i.value);
@@ -1535,9 +3386,11 @@ window.ROOKIE_POOL = [
     try { init({ settings: s, teams: E.defaultTeams(n, me, names), myKey: 't' + me, seasons, primaryIdx: 0, cfg: {}, source: 'csv', picks: [] }); }
     catch (e) { if (prevState.settings) init(prevState); return setupError(e.message); }
     closeModal();
-    toast(`已匯入 ${parsed.players.length} 名球員 (${seasons[0].label})${seasons[1] ? ',並載入 ' + seasons[1].label + ' 供比較' : ''}。`);
-    if (cmpWarning) toast(cmpWarning, true);
-    parsed.warnings.concat(A.model.notes).forEach((w) => toast(w, true));
+    const others = seasons.slice(1).map((s2) => s2.label);
+    toast(`已匯入 ${seasons[0].players.length} 名球員 (${seasons[0].label})${others.length ? ',並載入 ' + others.join('、') + ' 供比較/歷史混合' : ''}。`);
+    dataWarnings.forEach((w) => toast(w, true));
+    seasons.forEach((s2) => (s2.warnings || []).forEach((w) => toast(`「${s2.label}」: ${w}`, true)));
+    A.model.notes.forEach((w) => toast(w, true));
   }
 
   // ------------------------------------------------------------------ 事件
@@ -1564,6 +3417,45 @@ window.ROOKIE_POOL = [
     tab: (t) => { A.ui.tab = t.dataset.tab; renderPane(); },
     pos: (t) => { A.ui.pos = t.dataset.pos; A.ui.limit = 100; renderPlayers(); },
     sort: (t) => { const k = t.dataset.key; A.ui.sort = A.ui.sort.key === k ? { key: k, dir: -A.ui.sort.dir } : { key: k, dir: -1 }; renderPlayers(); },
+    'rec-tab': (t) => { A.ui.recTab = t.dataset.tab; renderRecs(); },
+    'toggle-live': () => { A.ui.live = !A.ui.live; renderAll(); },
+    'cal-scope': (t) => { A.ui.calScope = t.dataset.scope; renderPane(); },
+    'cal-archive': () => { archiveCalibration(false); renderPane(); },
+    'cal-clear': () => { if (confirm('確定要清除所有「過去選秀」的市場校準紀錄嗎?(本次選秀不受影響)')) { const h = loadCalHistory(); Object.keys(h.drafts).forEach((id) => { if (id !== A.draftId) delete h.drafts[id]; }); saveCalHistory(h); renderPane(); } },
+    'live-set': (t) => {
+      try { A.state.startAuction(t.dataset.pid, {}); } catch (e) { return toast(e.message, true); }
+      A.ui.live = true; A.ui.liveQ = ''; closeModal(); save(); renderAll();
+      const lp = $('#live'); if (lp && typeof lp.scrollIntoView === 'function') lp.scrollIntoView({ block: 'start' });   // 把現場模式面板捲到可見位置
+    },
+    'live-bid': () => {
+      const amt = Number($('#live-amt').value);
+      try { const r = A.state.placeBid($('#live-bidder').value, amt); r.warnings.forEach((w) => toast(w, true)); } catch (e) { return toast(e.message, true); }
+      save(); renderLive();
+    },
+    'live-undo-bid': () => { A.state.undoBid(); save(); renderLive(); },
+    'live-cancel': () => { A.state.cancelAuction(); save(); renderAll(); },
+    'live-complete': () => {
+      let pk;
+      try { pk = A.settings.isAuction ? A.state.completeAuction() : A.state.completeAuction($('#live-team').value); } catch (e) { return toast(e.message, true); }
+      save(); renderAll();
+      toast(`已記錄:${A.state.get(pk.pid).name} → ${pk.teamKey === A.myKey ? '我' : A.state.teamName(pk.teamKey)}${A.settings.isAuction ? ' ' + money(pk.price) : ''}`);
+    },
+    'save-override': (t) => {
+      const p = A.state.get(t.dataset.pid); if (!p) return;
+      const num = (id) => { const el = $(id); if (!el || el.value === '') return null; const x = Number(el.value); return Number.isFinite(x) ? x : null; };
+      const o = { valueAdjustment: num('#ov-value'), gpAdjustment: num('#ov-gp'), targetPrice: num('#ov-target'), priority: $('#ov-priority').value, doNotDraft: $('#ov-dnd').checked };
+      const empty = !o.valueAdjustment && !o.gpAdjustment && o.targetPrice == null && o.priority === 'normal' && !o.doNotDraft;
+      const prevOv = E.overrideFor(A.state, p);
+      if (prevOv && prevOv.key !== p.sid) delete A.overrides[prevOv.key];   // 依姓名對應到的舊鍵改存到穩定身分
+      if (empty) delete A.overrides[p.sid]; else A.overrides[p.sid] = Object.keys(o).reduce((acc, k) => (o[k] != null && o[k] !== '' ? Object.assign(acc, { [k]: o[k] }) : acc), {});
+      try { recompute(); } catch (e) { return toast(e.message, true); }
+      save(); renderAll(); openPlayer(p.pid); toast(empty ? '已清除手動調整。' : '已儲存手動調整。');
+    },
+    'clear-override': (t) => {
+      const p = A.state.get(t.dataset.pid); if (!p) return;
+      const prevOv = E.overrideFor(A.state, p); if (prevOv) delete A.overrides[prevOv.key];
+      recompute(); save(); renderAll(); openPlayer(p.pid); toast('已清除手動調整。');
+    },
     rpos: (t) => { A.ui.rpos = t.dataset.pos; renderRookiePool(); },
     rsort: (t) => { const k = t.dataset.key; A.ui.rsort = A.ui.rsort.key === k ? { key: k, dir: -A.ui.rsort.dir } : { key: k, dir: 1 }; renderRookiePool(); },
     more: () => { A.ui.limit += 100; renderPlayers(); },
@@ -1571,20 +3463,16 @@ window.ROOKIE_POOL = [
     'cfg-resetw': () => { $$('#cw-box .cw-row').forEach((row) => { const inp = row.querySelector('input[type=range]'); inp.value = '1'; const v = row.querySelector('.cw-val'); v.textContent = '1.0×'; v.className = 'cw-val'; }); },
     'save-settings': () => saveSettings(),
     export: () => {
-      const blob = new Blob([JSON.stringify({ picks: A.state.picks, teams: A.teams, settings: A.settings }, null, 1)], { type: 'application/json' });
+      const blob = new Blob([JSON.stringify({ modelVersion: E.VALUATION_MODEL_VERSION, decisionVersion: E.DECISION_MODEL_VERSION, configFingerprint: A.model.configFingerprint, exportedAt: new Date().toISOString(), picks: A.state.picks, teams: A.teams, settings: A.settings }, null, 1)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'draft-progress.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     },
     reset: () => { if (confirm('確定要清除這個瀏覽器裡的所有資料與選秀進度嗎?')) { localStorage.removeItem(LS_KEY); location.reload(); } },
     sim: (t) => {
-      const st = A.state, S = A.settings; let made = 0;
-      for (let i = 0; i < Number(t.dataset.n); i++) {
-        const teams = A.teams.filter((x) => x.key !== A.myKey && st.openSpots(x.key) > 0); if (!teams.length) break;
-        const tm = teams[Math.floor(Math.random() * teams.length)], pool = st.available().slice(0, 12), pick = pool[Math.floor(Math.random() * Math.min(6, pool.length))]; if (!pick) break;
-        const price = S.isAuction ? Math.max(S.minBid, Math.min(st.maxBid(tm.key), Math.round(pick.dollars * (0.8 + Math.random() * 0.5)))) : 0;
-        st.addPick(pick.pid, tm.key, price, 'sim'); made++;
-      }
-      save(); renderAll(); toast(`模擬了 ${made} 手。`);
+      const r = E.simulatePicks(A.state, A.cfg, Number(t.dataset.n));   // 與 Monte Carlo 相同的對手行為 (heuristic)
+      save(); renderAll(); toast(`模擬了 ${r.made} 手。${r.stoppedAtMyTurn ? '輪到你了。' : ''}`);
     },
+    'sim-run': () => startSimulation(),
+    'sim-cancel': () => cancelSimulation(),
   };
   document.addEventListener('click', (e) => {
     const t = e.target.closest('[data-act]'); if (!t) return;
@@ -1594,12 +3482,14 @@ window.ROOKIE_POOL = [
     const t = e.target;
     if (t.id === 'q') { A.ui.q = t.value; A.ui.limit = 100; if (A.state) renderPlayers(); }
     else if (t.id === 'rq-input') { A.ui.rq = t.value; if (A.state) renderRookiePool(); }
+    else if (t.id === 'live-q') { A.ui.liveQ = t.value; const h = $('#live-hits'); if (h) h.innerHTML = liveHitsHTML(); }
+    else if (t.id === 'live-nom') { if (A.state.currentAuction) { A.state.currentAuction.nominatedBy = t.value || null; save(); } }
     else if (t.id === 'f-season') {
-      const idx = Number(t.value);
-      if (idx !== A.primaryIdx) {
-        A.primaryIdx = idx;
+      const val = t.value === 'blend' ? 'blend' : Number(t.value);
+      if (val !== A.primaryIdx) {
+        A.primaryIdx = val;
         try { recompute(); } catch (e) { return toast(e.message, true); }
-        save(); renderAll(); toast(`已切換為以「${A.seasons[idx].label}」估值,另一年度變成比較基準。`);
+        save(); renderAll(); toast(`已切換為以「${primaryLabel()}」估值,另一年度變成比較基準。`);
       }
     }
     else if (t.id === 'f-cmp') { A.ui.showCmp = t.checked; renderPlayers(); }
@@ -1610,7 +3500,8 @@ window.ROOKIE_POOL = [
       v.textContent = w === 0 ? '放棄' : w.toFixed(1) + '×'; v.className = 'cw-val' + (w === 0 ? ' punt' : w > 1 ? ' boost' : '');
     }
     else if (t.id === 'c-need') { const l = $('#need-label'); if (l) l.textContent = Number(t.value).toFixed(1); }
-    else if (t.id === 'c-gp') { const l = $('#gp-label'); if (l) l.textContent = Number(t.value).toFixed(1); }
+    else if (t.id === 'c-avail') { const l = $('#avail-label'); if (l) l.textContent = Number(t.value).toFixed(1); }
+    else if (t.id === 'c-bench') { const l = $('#bench-label'); if (l) l.textContent = Number(t.value).toFixed(2); }
     else if (t.dataset && t.dataset.role === 'bid') updateVerdict();
     else if (t.id === 'pk-price') t.dataset.touched = '1';
   });
